@@ -414,31 +414,67 @@ def build_dashboard_embed(day):
 async def on_ready():
     """Bot startup event"""
     global DIALING_QUEUE_CHANNEL_ID, CURRENT_DASHBOARD_DAY
-    print(f'{bot.user} has connected to Discord!')
-    
-    # Find #dialing-queue channel
-    for guild in bot.guilds:
-        for channel in guild.channels:
-            if channel.name == 'dialing-queue':
-                DIALING_QUEUE_CHANNEL_ID = channel.id
-                break
-    
-    print(f"Dialing queue channel ID: {DIALING_QUEUE_CHANNEL_ID}")
-    
-    CURRENT_DASHBOARD_DAY = get_calendar_day()
-    
     try:
-        synced = await bot.tree.sync()
-        print(f'Synced {len(synced)} command(s)')
+        print(f'{bot.user} has connected to Discord!')
+        
+        # Find #dialing-queue channel
+        for guild in bot.guilds:
+            for channel in guild.channels:
+                if channel.name == 'dialing-queue':
+                    DIALING_QUEUE_CHANNEL_ID = channel.id
+                    break
+        
+        print(f"Dialing queue channel ID: {DIALING_QUEUE_CHANNEL_ID}")
+        
+        CURRENT_DASHBOARD_DAY = get_calendar_day()
+        
+        try:
+            synced = await bot.tree.sync()
+            print(f'Synced {len(synced)} command(s)')
+        except Exception as e:
+            print(f"Error syncing commands: {e}")
+        
+        # Start background tasks with error handling
+        try:
+            if not update_dashboard.is_running():
+                update_dashboard.start()
+                print("✅ Dashboard task started")
+        except Exception as e:
+            print(f"❌ Error starting dashboard task: {e}")
+        
+        try:
+            if not post_turn_announcements.is_running():
+                post_turn_announcements.start()
+                print("✅ Turn announcements task started")
+        except Exception as e:
+            print(f"❌ Error starting turn announcements task: {e}")
+        
+        try:
+            if not check_no_shows.is_running():
+                check_no_shows.start()
+                print("✅ No-shows task started")
+        except Exception as e:
+            print(f"❌ Error starting no-shows task: {e}")
+        
+        try:
+            if not check_slot_completion.is_running():
+                check_slot_completion.start()
+                print("✅ Slot completion task started")
+        except Exception as e:
+            print(f"❌ Error starting slot completion task: {e}")
+        
+        try:
+            if not update_summary_tab.is_running():
+                update_summary_tab.start()
+                print("✅ Summary tab task started")
+        except Exception as e:
+            print(f"❌ Error starting summary tab task: {e}")
+        
+        print("🚀 Bot fully initialized and ready!")
     except Exception as e:
-        print(e)
-    
-    # Start background tasks
-    update_dashboard.start()
-    post_turn_announcements.start()
-    check_no_shows.start()
-    check_slot_completion.start()
-    update_summary_tab.start()
+        print(f"❌ CRITICAL ERROR IN ON_READY: {e}")
+        import traceback
+        traceback.print_exc()
 
 @bot.event
 async def on_reaction_add(reaction, user):
