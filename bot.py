@@ -1056,16 +1056,18 @@ async def update_dashboard():
         # Build embed for the current displayed day
         embed = build_dashboard_embed(CURRENT_DASHBOARD_DAY)
         
-        # Create day navigation view
+        # Create day navigation view instance
         class DayNavigationView(discord.ui.View):
             async def on_timeout(self):
                 pass
+        
+        view = DayNavigationView()
         
         # Get all future days (7 days)
         future_days = get_future_days(7)
         valid_days = [d for d in future_days if d['name'] in DAYS]
         
-        # Add buttons for each day
+        # Add buttons for each day to the view instance
         for day_obj in valid_days:
             day_name = day_obj['name']
             label = f"{day_name}" + (" (Today)" if day_obj['is_today'] else "")
@@ -1077,21 +1079,21 @@ async def update_dashboard():
             
             button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
             button.callback = day_btn_callback
-            DayNavigationView.add_item(button)
+            view.add_item(button)
         
         # Try to find and edit existing pinned message
         found = False
         async for msg in channel.history(limit=20):
             if msg.author == bot.user and msg.embeds:
                 if "ZERO2HIRE CALLING SCHEDULER" in msg.embeds[0].title:
-                    await msg.edit(embed=embed, view=DayNavigationView())
+                    await msg.edit(embed=embed, view=view)
                     found = True
                     DASHBOARD_MESSAGE_ID = msg.id
                     break
         
         # If no existing message, send a new one and pin it
         if not found:
-            msg = await channel.send(embed=embed, view=DayNavigationView())
+            msg = await channel.send(embed=embed, view=view)
             await msg.pin()
             DASHBOARD_MESSAGE_ID = msg.id
     
