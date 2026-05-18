@@ -43,6 +43,7 @@ CALLING_SHEET_TAB = 'Calling_Schedule'
 SUMMARY_SHEET_TAB = 'Summary'
 DIALING_QUEUE_CHANNEL_ID = None
 DASHBOARD_MESSAGE_ID = None
+CURRENT_DASHBOARD_DAY = None  # Track which day is currently displayed
 
 TIME_SLOTS = ['7pm', '8pm', '9pm', '10pm', '11pm', '12am', '1am', '2am', '3am']
 DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
@@ -316,6 +317,95 @@ def get_future_days(days_ahead=7):
         })
     return result
 
+def build_dashboard_embed(day):
+    """Build dashboard embed for a specific day"""
+    data = get_calling_schedule_data()
+    
+    embed = discord.Embed(
+        title="🎙️ ZERO2HIRE CALLING SCHEDULER",
+        color=discord.Color.gold()
+    )
+    
+    # Find who's live now
+    live_member = None
+    current_slot = get_current_time_slot()
+    
+    if current_slot:
+        calling_day = get_current_calling_day()
+        if calling_day:
+            for row in data:
+                if (row.get('Date') == calling_day and 
+                    row.get('Time_Slot') == current_slot and 
+                    row.get('Status') == 'called'):
+                    live_member = row.get('Member_Name', '')
+                    break
+    
+    if live_member:
+        embed.add_field(
+            name="🔴 LIVE NOW",
+            value=f"**{live_member}** is calling ({current_slot})",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="🔴 LIVE NOW",
+            value="(No one calling right now)",
+            inline=False
+        )
+    
+    # Find next caller
+    next_slot = get_next_time_slot()
+    next_member = None
+    calling_day = get_current_calling_day()
+    
+    if next_slot and calling_day:
+        for row in data:
+            if (row.get('Date') == calling_day and 
+                row.get('Time_Slot') == next_slot and 
+                row.get('Status') in ['booked', 'called']):
+                next_member = row.get('Member_Name', '')
+                break
+    
+    if next_member:
+        embed.add_field(
+            name="⏭️ NEXT UP",
+            value=f"**{next_member}** ({next_slot})",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="⏭️ NEXT UP",
+            value="(Check back soon)",
+            inline=False
+        )
+    
+    # Show all slots for the selected day
+    queue_text = ""
+    for slot in TIME_SLOTS:
+        booked_member = None
+        for row in data:
+            if (row.get('Date') == day and 
+                row.get('Time_Slot') == slot):
+                status = row.get('Status', '')
+                if status in ['booked', 'called']:
+                    booked_member = row.get('Member_Name', '')
+                break
+        
+        if booked_member:
+            queue_text += f"✅ {slot} → **{booked_member}**\n"
+        else:
+            queue_text += f"⏳ {slot} → (Open)\n"
+    
+    embed.add_field(
+        name=f"👥 {day.upper()}'S QUEUE",
+        value=queue_text or "All slots open",
+        inline=False
+    )
+    
+    embed.set_footer(text="📋 /book to book a slot | /help for more info")
+    
+    return embed
+
 # ============================================================================
 # DISCORD BOT EVENTS
 # ============================================================================
@@ -323,7 +413,7 @@ def get_future_days(days_ahead=7):
 @bot.event
 async def on_ready():
     """Bot startup event"""
-    global DIALING_QUEUE_CHANNEL_ID
+    global DIALING_QUEUE_CHANNEL_ID, CURRENT_DASHBOARD_DAY
     print(f'{bot.user} has connected to Discord!')
     
     # Find #dialing-queue channel
@@ -334,6 +424,8 @@ async def on_ready():
                 break
     
     print(f"Dialing queue channel ID: {DIALING_QUEUE_CHANNEL_ID}")
+    
+    CURRENT_DASHBOARD_DAY = get_calendar_day()
     
     try:
         synced = await bot.tree.sync()
@@ -712,8 +804,8 @@ async def post_turn_announcements():
                                     inline=False
                                 )
                                 embed.add_field(
-                                    name="📢 What to do at {next_slot} time",
-                                    value="React ✅ below to mark yourself as calling.\nYou'll see a fresh 'YOUR TURN NOW' message when it's time.",
+                                    name="📢 What to do",
+                                    value="React ✅ below when you're ready at slot time.\nYou'll get another message when it's time!",
                                     inline=False
                                 )
                                 msg = await channel.send(embed=embed)
@@ -765,7 +857,7 @@ async def post_turn_announcements():
 
 @tasks.loop(minutes=1)
 async def check_no_shows():
-    """Check for no-shows (10 min after slot start with no reaction)"""
+    """Check for no-shows (10 min after slot start with no reaction) - NO DM SENT"""
     if not DIALING_QUEUE_CHANNEL_ID:
         return
     
@@ -813,7 +905,7 @@ async def check_no_shows():
                 NO_SHOWS_ANNOUNCED[announcement_key] = True
                 
                 try:
-                    # Announce in #dialing-queue (NO DM)
+                    # Announce in #dialing-queue ONLY (NO DM)
                     channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
                     if channel:
                         embed = discord.Embed(
@@ -910,7 +1002,9 @@ async def check_slot_completion():
 
 @tasks.loop(seconds=10)
 async def update_dashboard():
-    """Update the pinned dashboard embed every 10 seconds with day navigation"""
+    """Update the pinned dashboard every 10 seconds with 7-day navigation"""
+    global DASHBOARD_MESSAGE_ID, CURRENT_DASHBOARD_DAY
+    
     if not DIALING_QUEUE_CHANNEL_ID:
         return
     
@@ -919,106 +1013,51 @@ async def update_dashboard():
         return
     
     try:
-        # Build dashboard embed for today
-        data = get_calling_schedule_data()
-        today = get_calendar_day()
+        # Get the day to display (default to today)
+        if not CURRENT_DASHBOARD_DAY:
+            CURRENT_DASHBOARD_DAY = get_calendar_day()
         
-        embed = discord.Embed(
-            title="🎙️ ZERO2HIRE CALLING SCHEDULER",
-            color=discord.Color.gold()
-        )
+        # Build embed for the current displayed day
+        embed = build_dashboard_embed(CURRENT_DASHBOARD_DAY)
         
-        # Find who's live now
-        live_member = None
-        current_slot = get_current_time_slot()
+        # Create day navigation view
+        class DayNavigationView(discord.ui.View):
+            async def on_timeout(self):
+                pass
         
-        if current_slot:
-            calling_day = get_current_calling_day()
-            if calling_day:
-                for row in data:
-                    if (row.get('Date') == calling_day and 
-                        row.get('Time_Slot') == current_slot and 
-                        row.get('Status') == 'called'):
-                        live_member = row.get('Member_Name', '')
-                        break
+        # Get all future days (7 days)
+        future_days = get_future_days(7)
+        valid_days = [d for d in future_days if d['name'] in DAYS]
         
-        if live_member:
-            embed.add_field(
-                name="🔴 LIVE NOW",
-                value=f"**{live_member}** is calling ({current_slot})",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name="🔴 LIVE NOW",
-                value="(No one calling right now)",
-                inline=False
-            )
-        
-        # Find next caller
-        next_slot = get_next_time_slot()
-        next_member = None
-        calling_day = get_current_calling_day()
-        
-        if next_slot and calling_day:
-            for row in data:
-                if (row.get('Date') == calling_day and 
-                    row.get('Time_Slot') == next_slot and 
-                    row.get('Status') in ['booked', 'called']):
-                    next_member = row.get('Member_Name', '')
-                    break
-        
-        if next_member:
-            embed.add_field(
-                name="⏭️ NEXT UP",
-                value=f"**{next_member}** ({next_slot})",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name="⏭️ NEXT UP",
-                value="(Check back soon)",
-                inline=False
-            )
-        
-        # Show all slots for today
-        queue_text = ""
-        for slot in TIME_SLOTS:
-            booked_member = None
-            for row in data:
-                if (row.get('Date') == today and 
-                    row.get('Time_Slot') == slot):
-                    status = row.get('Status', '')
-                    if status in ['booked', 'called']:
-                        booked_member = row.get('Member_Name', '')
-                    break
+        # Add buttons for each day
+        for day_obj in valid_days:
+            day_name = day_obj['name']
+            label = f"{day_name}" + (" (Today)" if day_obj['is_today'] else "")
             
-            if booked_member:
-                queue_text += f"✅ {slot} → **{booked_member}**\n"
-            else:
-                queue_text += f"⏳ {slot} → (Open)\n"
-        
-        embed.add_field(
-            name="👥 TODAY'S QUEUE",
-            value=queue_text or "All slots open",
-            inline=False
-        )
-        
-        embed.set_footer(text="📋 /book to book a slot | /help for more info")
+            async def day_btn_callback(interaction: discord.Interaction, d=day_name):
+                global CURRENT_DASHBOARD_DAY
+                CURRENT_DASHBOARD_DAY = d
+                await interaction.response.defer()
+            
+            button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
+            button.callback = day_btn_callback
+            DayNavigationView.add_item(button)
         
         # Try to find and edit existing pinned message
-        try:
-            async for msg in channel.history(limit=20):
-                if msg.author == bot.user and msg.embeds:
-                    if "ZERO2HIRE CALLING SCHEDULER" in msg.embeds[0].title:
-                        await msg.edit(embed=embed)
-                        return
-        except:
-            pass
+        found = False
+        async for msg in channel.history(limit=20):
+            if msg.author == bot.user and msg.embeds:
+                if "ZERO2HIRE CALLING SCHEDULER" in msg.embeds[0].title:
+                    await msg.edit(embed=embed, view=DayNavigationView())
+                    found = True
+                    DASHBOARD_MESSAGE_ID = msg.id
+                    break
         
-        # If no existing message, send a new one
-        msg = await channel.send(embed=embed)
-        await msg.pin()
+        # If no existing message, send a new one and pin it
+        if not found:
+            msg = await channel.send(embed=embed, view=DayNavigationView())
+            await msg.pin()
+            DASHBOARD_MESSAGE_ID = msg.id
     
     except Exception as e:
         print(f"Error updating dashboard: {e}")
