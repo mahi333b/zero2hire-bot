@@ -80,6 +80,7 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 DIALING_QUEUE_CHANNEL_ID = None
 DASHBOARD_MESSAGE_ID = None
 CURRENT_DASHBOARD_DAY = None
+DASHBOARD_VIEW = None  # Initialized inside on_ready() after event loop starts
 
 # Async locks for thread-safe state management
 STATE_LOCK = asyncio.Lock()
@@ -503,19 +504,18 @@ class DashboardView(discord.ui.View):
         """Refresh buttons daily to keep Mon-Fri rolling window current."""
         self._build_buttons()
 
-
-DASHBOARD_VIEW = DashboardView()
-
 # ============================================================================
 # DISCORD BOT EVENTS
 # ============================================================================
 
 @bot.event
 async def on_ready():
-    global DIALING_QUEUE_CHANNEL_ID, CURRENT_DASHBOARD_DAY
+    global DIALING_QUEUE_CHANNEL_ID, CURRENT_DASHBOARD_DAY, DASHBOARD_VIEW
 
     logger.info(f'{bot.user} has connected to Discord!')
 
+    # Initialize DASHBOARD_VIEW here so it runs inside the event loop
+    DASHBOARD_VIEW = DashboardView()
     bot.add_view(DASHBOARD_VIEW)
 
     for guild in bot.guilds:
