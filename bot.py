@@ -470,19 +470,23 @@ def build_dashboard_embed(day):
 # ============================================================================
 
 class DashboardView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self._build_buttons()
+    def __init__(self, is_persistent=False):
+        super().__init__(timeout=None if is_persistent else 300)  # 5 min timeout for private views
+        self._build_buttons(is_persistent)
 
-    def _build_buttons(self):
+    def _build_buttons(self, is_persistent=False):
         self.clear_items()
         for day_obj in get_future_days():
             day_name = day_obj['name']
             label = day_name + (" (Today)" if day_obj['is_today'] else "")
+            
             btn = discord.ui.Button(
                 label=label,
                 style=discord.ButtonStyle.secondary,
             )
+            if is_persistent:
+                btn.custom_id = f"dash_day_{day_name}"
+            
             btn.callback = self._make_day_callback(day_name)
             self.add_item(btn)
 
@@ -492,10 +496,10 @@ class DashboardView(discord.ui.View):
                 await interaction.response.defer(ephemeral=True)
                 embed = build_dashboard_embed(day_name)
                 
-                # Send private response only to the user who clicked
+                # Send private response
                 await interaction.followup.send(
                     embed=embed, 
-                    view=DashboardView(),  # Fresh buttons
+                    view=DashboardView(is_persistent=False),  
                     ephemeral=True
                 )
                 
@@ -503,7 +507,10 @@ class DashboardView(discord.ui.View):
                 
             except Exception as e:
                 logger.error(f"Error in dashboard button: {e}")
-                await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
+                try:
+                    await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
+                except:
+                    pass
 
         return callback
 
@@ -519,7 +526,7 @@ async def on_ready():
 
     # Initialize DASHBOARD_VIEW here so it runs inside the event loop
     DASHBOARD_VIEW = DashboardView()
-    bot.add_view(DashboardView())   # Allow multiple instances
+    bot.add_view(DASHBOARD_VIEW)   # This is for the main public dashboard
 
     for guild in bot.guilds:
         for channel in guild.channels:
@@ -789,7 +796,7 @@ async def update_dashboard():
                     return
 
         # Create new dashboard if not found
-        msg = await channel.send(embed=embed, view=DashboardView())
+        msg = await channel.send(embed=embed, view=DashboardView(is_persistent=True))
         await msg.pin()
         async with STATE_LOCK:
             DASHBOARD_MESSAGE_ID = msg.id
