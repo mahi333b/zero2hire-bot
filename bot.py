@@ -7,8 +7,45 @@ from datetime import datetime, timedelta
 import asyncio
 import pytz
 from typing import Optional, List, Dict
+import logging
 
 load_dotenv()
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# ENVIRONMENT VARIABLE VALIDATION
+# ============================================================================
+
+def validate_env_vars():
+    """Validate all required environment variables exist before starting bot."""
+    required_vars = {
+        'DISCORD_TOKEN': 'Discord bot token',
+        'NOTION_TOKEN': 'Notion API token',
+        'BOOKINGS_DATABASE_ID': 'Notion database ID for bookings'
+    }
+    
+    missing = []
+    for var, description in required_vars.items():
+        if not os.getenv(var):
+            missing.append(f"{var} ({description})")
+    
+    if missing:
+        error_msg = f"❌ Missing required environment variables:\n" + "\n".join(f"  • {v}" for v in missing)
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    
+    logger.info("✅ All environment variables validated")
+
+validate_env_vars()
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 NOTION_TOKEN = os.getenv('NOTION_TOKEN')
@@ -16,11 +53,18 @@ BOOKINGS_DATABASE_ID = os.getenv('BOOKINGS_DATABASE_ID')
 
 BD_TZ = pytz.timezone('Asia/Dhaka')
 
+# ============================================================================
+# NOTION CLIENT INITIALIZATION
+# ============================================================================
+
 try:
     notion = Client(auth=NOTION_TOKEN)
+    # Test connection
+    notion.databases.retrieve(database_id=BOOKINGS_DATABASE_ID)
+    logger.info("✅ Notion connected successfully")
 except Exception as e:
-    print(f"Error initializing Notion: {e}")
-    notion = None
+    logger.error(f"❌ Failed to initialize Notion: {e}")
+    raise RuntimeError(f"Cannot connect to Notion. Check your token and database ID: {e}")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -30,17 +74,21 @@ intents.reactions = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
 # ============================================================================
-# GLOBAL STATE
+# GLOBAL STATE WITH LOCKS
 # ============================================================================
 
 DIALING_QUEUE_CHANNEL_ID = None
 DASHBOARD_MESSAGE_ID = None
 CURRENT_DASHBOARD_DAY = None
 
+# Async locks for thread-safe state management
+STATE_LOCK = asyncio.Lock()
+CONFIRMATION_LOCK = asyncio.Lock()
+
 TIME_SLOTS = ['7pm', '8pm', '9pm', '10pm', '11pm', '12am', '1am', '2am', '3am']
 DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 
-PENDING_CONFIRMATIONS = {}  # {f"{day}_{slot}": member_id}
+PENDING_CONFIRMATIONS = {}  # {f"{day}_{slot}": (member_id, expiry_time)}
 
 CACHE = {
     'bookings': None,
@@ -53,14 +101,17 @@ CACHE = {
 # ============================================================================
 
 def get_bd_time():
+    """Get current time in Bangladesh timezone."""
     return datetime.now(BD_TZ)
 
 def get_calendar_day():
+    """Get current calendar day name."""
     days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
     return days[get_bd_time().weekday()]
 
 def get_current_calling_day():
     """
+    Determine the "calling day" based on current time.
     7pm-11:59pm -> same calendar day
     12am-3:59am -> previous calendar day (overnight shift)
     Outside window -> None
@@ -79,6 +130,7 @@ def get_current_calling_day():
     return days[calling_day.weekday()]
 
 def get_current_time_slot():
+    """Get current time slot (or None if outside calling hours)."""
     hour = get_bd_time().hour
     slot_map = {
         19: '7pm', 20: '8pm', 21: '9pm', 22: '10pm', 23: '11pm',
@@ -87,6 +139,7 @@ def get_current_time_slot():
     return slot_map.get(hour)
 
 def get_next_time_slot():
+    """Get next time slot (or None if outside calling hours)."""
     hour = get_bd_time().hour
     next_hour = (hour + 1) % 24
     slot_map = {
@@ -95,14 +148,19 @@ def get_next_time_slot():
     }
     return slot_map.get(next_hour)
 
+def is_valid_slot(day: str, time_slot: str) -> bool:
+    """Validate that day and time_slot are in allowed lists."""
+    return day in DAYS and time_slot in TIME_SLOTS
+
 def invalidate_cache():
+    """Clear the bookings cache."""
     global CACHE
     CACHE['bookings'] = None
     CACHE['timestamp'] = None
+    logger.debug("Cache invalidated")
 
 def query_notion_database():
-    if not notion:
-        return []
+    """Query all pages from the Notion bookings database."""
     try:
         results = []
         has_more = True
@@ -121,12 +179,14 @@ def query_notion_database():
             has_more = response.get('has_more', False)
             start_cursor = response.get('next_cursor')
 
+        logger.debug(f"Queried {len(results)} bookings from Notion")
         return results
     except Exception as e:
-        print(f"Error querying Notion database: {e}")
+        logger.error(f"Error querying Notion database: {e}")
         return []
 
 def get_all_bookings():
+    """Get all bookings with caching (10-second TTL)."""
     global CACHE
 
     now = datetime.now()
@@ -156,7 +216,7 @@ def get_all_bookings():
             }
             bookings.append(booking)
         except Exception as e:
-            print(f"Error parsing booking page {page.get('id', 'unknown')}: {e}")
+            logger.warning(f"Error parsing booking page {page.get('id', 'unknown')}: {e}")
             continue
 
     CACHE['bookings'] = bookings
@@ -165,6 +225,11 @@ def get_all_bookings():
     return bookings
 
 def get_slot_booking(day, time_slot):
+    """Get the booking for a specific day and time slot."""
+    if not is_valid_slot(day, time_slot):
+        logger.warning(f"Invalid slot requested: {day} {time_slot}")
+        return None
+    
     bookings = get_all_bookings()
     for booking in bookings:
         if (booking['day'] == day and
@@ -174,6 +239,11 @@ def get_slot_booking(day, time_slot):
     return None
 
 def member_has_slot_on_day(member_id, day):
+    """Check if member already has a booking on this specific day."""
+    if day not in DAYS:
+        logger.warning(f"Invalid day requested: {day}")
+        return False
+    
     bookings = get_all_bookings()
     for booking in bookings:
         if (booking['day'] == day and
@@ -183,10 +253,15 @@ def member_has_slot_on_day(member_id, day):
     return False
 
 def create_booking(member_id, member_name, day, time_slot):
-    if not notion:
+    """Create a new booking in Notion."""
+    # Validate inputs
+    if not is_valid_slot(day, time_slot):
+        logger.warning(f"Invalid slot for booking: {day} {time_slot}")
         return False
 
+    # Check slot not already taken
     if get_slot_booking(day, time_slot):
+        logger.info(f"Slot {day} {time_slot} already booked")
         return False
 
     try:
@@ -202,15 +277,14 @@ def create_booking(member_id, member_name, day, time_slot):
             }
         )
         invalidate_cache()
+        logger.info(f"Booking created: {member_name} ({member_id}) for {day} {time_slot}")
         return True
     except Exception as e:
-        print(f"Error creating booking for {member_name} ({member_id}): {e}")
+        logger.error(f"Error creating booking for {member_name} ({member_id}): {e}")
         return False
 
 def update_booking_status(page_id, new_status, field_to_update=None, value=None):
-    if not notion:
-        return False
-
+    """Update booking status and optional fields in Notion."""
     try:
         update_dict = {
             "Status": {"select": {"name": new_status}}
@@ -226,12 +300,14 @@ def update_booking_status(page_id, new_status, field_to_update=None, value=None)
 
         notion.pages.update(page_id=page_id, properties=update_dict)
         invalidate_cache()
+        logger.info(f"Booking {page_id} updated to status: {new_status}")
         return True
     except Exception as e:
-        print(f"Error updating booking {page_id} to {new_status}: {e}")
+        logger.error(f"Error updating booking {page_id} to {new_status}: {e}")
         return False
 
 def mark_as_called(member_id, day, time_slot):
+    """Mark a booking as 'called' (in progress)."""
     bookings = get_all_bookings()
     for booking in bookings:
         if (booking['day'] == day and
@@ -243,18 +319,22 @@ def mark_as_called(member_id, day, time_slot):
                 'Called_At',
                 get_bd_time().isoformat()
             )
+    logger.warning(f"Booking not found for {member_id} {day} {time_slot}")
     return False
 
 def mark_as_no_show(day, time_slot):
+    """Mark a booking as 'no-show'."""
     bookings = get_all_bookings()
     for booking in bookings:
         if (booking['day'] == day and
             booking['Time_Slot'] == time_slot and
             booking['Status'] == 'booked'):
             return update_booking_status(booking['id'], 'no-show')
+    logger.warning(f"No booked slot found for {day} {time_slot}")
     return False
 
 def mark_slot_complete(member_id, day, time_slot):
+    """Mark a slot as complete with 60-minute duration."""
     bookings = get_all_bookings()
     for booking in bookings:
         if (booking['day'] == day and
@@ -262,16 +342,11 @@ def mark_slot_complete(member_id, day, time_slot):
             booking['Member_ID'] == str(member_id) and
             booking['Status'] == 'called'):
             return update_booking_status(booking['id'], 'called', 'Duration_Minutes', 60)
+    logger.warning(f"Active booking not found for {member_id} {day} {time_slot}")
     return False
 
 def get_member_slots(member_id):
-    """
-    FIX: Removed broken datetime math that was silently dropping valid bookings.
-    Status is the source of truth:
-      - 'booked'  = confirmed, not yet started
-      - 'called'  = currently in session
-    Completed/no-show/cancelled slots won't appear because their status has moved on.
-    """
+    """Get all active slots for a member (booked or called)."""
     bookings = get_all_bookings()
     slots = []
 
@@ -287,6 +362,11 @@ def get_member_slots(member_id):
     return slots
 
 def get_available_slots(day):
+    """Get all available time slots for a given day."""
+    if day not in DAYS:
+        logger.warning(f"Invalid day for availability check: {day}")
+        return []
+    
     available = []
     for slot in TIME_SLOTS:
         if not get_slot_booking(day, slot):
@@ -294,6 +374,7 @@ def get_available_slots(day):
     return available
 
 def get_future_days():
+    """Get next 7 days, filtering for Mon-Fri."""
     today = get_bd_time()
     result = []
     days_list = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
@@ -312,6 +393,7 @@ def get_future_days():
     return result
 
 def build_dashboard_embed(day):
+    """Build the dashboard embed for a given day."""
     bookings = get_all_bookings()
 
     embed = discord.Embed(
@@ -407,10 +489,10 @@ class DashboardView(discord.ui.View):
     def _make_day_callback(self, day_name: str):
         async def callback(interaction: discord.Interaction):
             global CURRENT_DASHBOARD_DAY
-            CURRENT_DASHBOARD_DAY = day_name
+            
+            async with STATE_LOCK:
+                CURRENT_DASHBOARD_DAY = day_name
 
-            # FIX: Defer immediately to beat Discord's 3-second interaction timeout.
-            # Then build the embed (slow Notion call) and edit the message after.
             await interaction.response.defer()
             embed = build_dashboard_embed(day_name)
             await interaction.message.edit(embed=embed, view=self)
@@ -418,11 +500,10 @@ class DashboardView(discord.ui.View):
         return callback
 
     def refresh_buttons(self):
-        """Call daily to keep the Mon-Fri rolling window current."""
+        """Refresh buttons daily to keep Mon-Fri rolling window current."""
         self._build_buttons()
 
 
-# Single persistent instance — registered with bot on startup
 DASHBOARD_VIEW = DashboardView()
 
 # ============================================================================
@@ -433,66 +514,81 @@ DASHBOARD_VIEW = DashboardView()
 async def on_ready():
     global DIALING_QUEUE_CHANNEL_ID, CURRENT_DASHBOARD_DAY
 
-    print(f'{bot.user} has connected to Discord!')
+    logger.info(f'{bot.user} has connected to Discord!')
 
-    # Reconnects persistent view buttons after restarts
     bot.add_view(DASHBOARD_VIEW)
 
     for guild in bot.guilds:
         for channel in guild.channels:
             if channel.name == 'dialing-queue':
                 DIALING_QUEUE_CHANNEL_ID = channel.id
+                logger.info(f"✅ Found dialing-queue channel: {DIALING_QUEUE_CHANNEL_ID}")
                 break
 
-    print(f"✅ Dialing queue channel ID: {DIALING_QUEUE_CHANNEL_ID}")
-
-    CURRENT_DASHBOARD_DAY = get_calendar_day()
+    async with STATE_LOCK:
+        CURRENT_DASHBOARD_DAY = get_calendar_day()
 
     try:
         synced = await bot.tree.sync()
-        print(f'✅ Synced {len(synced)} command(s)')
+        logger.info(f'✅ Synced {len(synced)} command(s)')
     except Exception as e:
-        print(f"❌ Error syncing commands: {e}")
+        logger.error(f"Error syncing commands: {e}")
 
     if not update_dashboard.is_running():
         update_dashboard.start()
-        print("✅ Dashboard task started")
+        logger.info("✅ Dashboard task started")
 
     if not send_reminders.is_running():
         send_reminders.start()
-        print("✅ Reminder task started")
+        logger.info("✅ Reminder task started")
 
     if not check_confirmations.is_running():
         check_confirmations.start()
-        print("✅ Confirmation checker started")
+        logger.info("✅ Confirmation checker started")
 
     if not auto_complete_slots.is_running():
         auto_complete_slots.start()
-        print("✅ Auto-complete task started")
+        logger.info("✅ Auto-complete task started")
 
-    print("🚀 Bot ready!")
+    if not cleanup_confirmations.is_running():
+        cleanup_confirmations.start()
+        logger.info("✅ Confirmation cleanup started")
+
+    logger.info("🚀 Bot ready!")
 
 
 @bot.event
 async def on_reaction_add(reaction, user):
+    """Handle reaction to confirmation DM."""
     if user == bot.user:
         return
 
     if reaction.emoji != '👍':
         return
 
+    # Only process reactions in DMs
     if not isinstance(reaction.message.channel, discord.DMChannel):
         return
 
-    for key, member_id in list(PENDING_CONFIRMATIONS.items()):
-        if member_id == user.id:
-            day, time_slot = key.split('_', 1)
-            if mark_as_called(user.id, day, time_slot):
-                await user.send(f"✅ Confirmed! You're now live for **{day} {time_slot}**. You have 60 minutes — go!")
-                del PENDING_CONFIRMATIONS[key]
-            else:
-                await user.send("⚠️ Could not confirm your slot. Please message an admin.")
-            return
+    async with CONFIRMATION_LOCK:
+        for key, (member_id, expiry) in list(PENDING_CONFIRMATIONS.items()):
+            if member_id == user.id:
+                # Check if confirmation has expired
+                if get_bd_time() > expiry:
+                    logger.info(f"Confirmation expired for {user.id}: {key}")
+                    del PENDING_CONFIRMATIONS[key]
+                    await user.send("⚠️ Your confirmation window has expired. Use /book to reschedule.")
+                    return
+
+                day, time_slot = key.split('_', 1)
+                if mark_as_called(user.id, day, time_slot):
+                    await user.send(f"✅ Confirmed! You're now live for **{day} {time_slot}**. You have 60 minutes — go!")
+                    del PENDING_CONFIRMATIONS[key]
+                    logger.info(f"Member {user.id} confirmed for {day} {time_slot}")
+                else:
+                    await user.send("⚠️ Could not confirm your slot. Please message an admin.")
+                    logger.error(f"Failed to mark {user.id} as called for {day} {time_slot}")
+                return
 
 # ============================================================================
 # SLASH COMMANDS
@@ -554,11 +650,13 @@ async def book_command(interaction: discord.Interaction):
                             inline=False
                         )
                         await time_interaction.response.send_message(embed=embed, ephemeral=True)
+                        logger.info(f"Booking confirmed for {member.display_name}: {dn} {ts}")
                     else:
                         await time_interaction.response.send_message(
                             "❌ That slot was just taken! Pick another.",
                             ephemeral=True
                         )
+                        logger.warning(f"Slot collision for {dn} {ts}")
 
                 button = discord.ui.Button(label=time_slot, style=discord.ButtonStyle.success)
                 button.callback = time_callback
@@ -646,6 +744,7 @@ async def help_command(interaction: discord.Interaction):
 
 @tasks.loop(seconds=30)
 async def update_dashboard():
+    """Update the dashboard message every 30 seconds."""
     global DASHBOARD_MESSAGE_ID, CURRENT_DASHBOARD_DAY
 
     if not DIALING_QUEUE_CHANNEL_ID:
@@ -656,10 +755,12 @@ async def update_dashboard():
         return
 
     try:
-        if not CURRENT_DASHBOARD_DAY:
-            CURRENT_DASHBOARD_DAY = get_calendar_day()
+        async with STATE_LOCK:
+            if not CURRENT_DASHBOARD_DAY:
+                CURRENT_DASHBOARD_DAY = get_calendar_day()
+            day_to_display = CURRENT_DASHBOARD_DAY
 
-        embed = build_dashboard_embed(CURRENT_DASHBOARD_DAY)
+        embed = build_dashboard_embed(day_to_display)
 
         if DASHBOARD_MESSAGE_ID:
             try:
@@ -667,30 +768,37 @@ async def update_dashboard():
                 await msg.edit(embed=embed, view=DASHBOARD_VIEW)
                 return
             except discord.NotFound:
-                print("Dashboard message not found — will recreate.")
-                DASHBOARD_MESSAGE_ID = None
+                logger.warning("Dashboard message not found — will recreate")
+                async with STATE_LOCK:
+                    DASHBOARD_MESSAGE_ID = None
             except Exception as e:
-                print(f"Error editing dashboard message: {e}")
-                DASHBOARD_MESSAGE_ID = None
+                logger.error(f"Error editing dashboard message: {e}")
+                async with STATE_LOCK:
+                    DASHBOARD_MESSAGE_ID = None
 
+        # Search for existing dashboard in recent messages
         async for msg in channel.history(limit=20):
             if msg.author == bot.user and msg.embeds:
                 if "ZERO2HIRE CALLING SCHEDULER" in msg.embeds[0].title:
-                    DASHBOARD_MESSAGE_ID = msg.id
+                    async with STATE_LOCK:
+                        DASHBOARD_MESSAGE_ID = msg.id
                     await msg.edit(embed=embed, view=DASHBOARD_VIEW)
                     return
 
+        # Create new dashboard if not found
         msg = await channel.send(embed=embed, view=DASHBOARD_VIEW)
         await msg.pin()
-        DASHBOARD_MESSAGE_ID = msg.id
-        print(f"✅ Dashboard created: {DASHBOARD_MESSAGE_ID}")
+        async with STATE_LOCK:
+            DASHBOARD_MESSAGE_ID = msg.id
+        logger.info(f"✅ Dashboard created: {DASHBOARD_MESSAGE_ID}")
 
     except Exception as e:
-        print(f"Dashboard update error: {e}")
+        logger.error(f"Dashboard update error: {e}")
 
 
 @tasks.loop(minutes=1)
 async def send_reminders():
+    """Send reminders and confirmation requests."""
     now = get_bd_time()
     hour = now.hour
     minute = now.minute
@@ -718,8 +826,9 @@ async def send_reminders():
                             color=discord.Color.blue()
                         )
                         await user.send(embed=embed)
+                        logger.info(f"30-min reminder sent to {booking['Member_Name']}")
                     except Exception as e:
-                        print(f"Error sending 30-min reminder to {booking['Member_ID']}: {e}")
+                        logger.error(f"Error sending 30-min reminder to {booking['Member_ID']}: {e}")
 
     # At slot start — send confirmation DM
     elif minute == 0:
@@ -743,13 +852,20 @@ async def send_reminders():
                         )
                         msg = await user.send(embed=embed)
                         await msg.add_reaction('👍')
-                        PENDING_CONFIRMATIONS[f"{calling_day}_{current_slot}"] = int(booking['Member_ID'])
+                        
+                        # Set expiry to 10 minutes from now
+                        expiry = get_bd_time() + timedelta(minutes=10)
+                        async with CONFIRMATION_LOCK:
+                            PENDING_CONFIRMATIONS[f"{calling_day}_{current_slot}"] = (int(booking['Member_ID']), expiry)
+                        
+                        logger.info(f"Confirmation request sent to {booking['Member_Name']}")
                     except Exception as e:
-                        print(f"Error sending slot-start DM to {booking['Member_ID']}: {e}")
+                        logger.error(f"Error sending slot-start DM to {booking['Member_ID']}: {e}")
 
 
 @tasks.loop(minutes=1)
 async def check_confirmations():
+    """Check for missed confirmations (10 minutes after slot start)."""
     now = get_bd_time()
     hour = now.hour
     minute = now.minute
@@ -771,8 +887,12 @@ async def check_confirmations():
         return
 
     key = f"{calling_day}_{current_slot}"
-    if key not in PENDING_CONFIRMATIONS:
-        return
+    
+    async with CONFIRMATION_LOCK:
+        if key not in PENDING_CONFIRMATIONS:
+            return
+        
+        member_id, expiry = PENDING_CONFIRMATIONS[key]
 
     booking = get_slot_booking(calling_day, current_slot)
     if booking and booking['Status'] == 'booked':
@@ -789,14 +909,18 @@ async def check_confirmations():
                 color=discord.Color.orange()
             )
             await user.send(embed=embed)
+            logger.info(f"No-show recorded for {booking['Member_Name']}")
         except Exception as e:
-            print(f"Error sending no-show DM to {booking['Member_ID']}: {e}")
+            logger.error(f"Error sending no-show DM to {booking['Member_ID']}: {e}")
 
-    del PENDING_CONFIRMATIONS[key]
+    async with CONFIRMATION_LOCK:
+        if key in PENDING_CONFIRMATIONS:
+            del PENDING_CONFIRMATIONS[key]
 
 
 @tasks.loop(minutes=1)
 async def auto_complete_slots():
+    """Auto-complete slots 60 minutes after start."""
     now = get_bd_time()
     hour = now.hour
     minute = now.minute
@@ -817,6 +941,7 @@ async def auto_complete_slots():
 
     calling_day = get_current_calling_day()
     if not calling_day:
+        # If outside calling window, use current calendar day
         calling_day = get_calendar_day()
 
     booking = get_slot_booking(calling_day, completed_slot)
@@ -831,12 +956,35 @@ async def auto_complete_slots():
                 color=discord.Color.green()
             )
             await user.send(embed=embed)
+            logger.info(f"Session completed for {booking['Member_Name']}")
         except Exception as e:
-            print(f"Error sending completion DM to {booking['Member_ID']}: {e}")
+            logger.error(f"Error sending completion DM to {booking['Member_ID']}: {e}")
+
+
+@tasks.loop(minutes=5)
+async def cleanup_confirmations():
+    """Clean up expired confirmations every 5 minutes."""
+    now = get_bd_time()
+    
+    async with CONFIRMATION_LOCK:
+        expired_keys = []
+        for key, (member_id, expiry) in PENDING_CONFIRMATIONS.items():
+            if now > expiry:
+                expired_keys.append(key)
+        
+        for key in expired_keys:
+            del PENDING_CONFIRMATIONS[key]
+        
+        if expired_keys:
+            logger.info(f"Cleaned up {len(expired_keys)} expired confirmations")
 
 # ============================================================================
 # RUN BOT
 # ============================================================================
 
 if __name__ == '__main__':
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        logger.error(f"❌ Failed to start bot: {e}")
+        raise
