@@ -1,4 +1,4 @@
 discord.py
-notion-client>=2.2.1
+notion-client>=1.0.0
 python-dotenv
 pytz
