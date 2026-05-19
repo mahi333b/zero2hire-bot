@@ -701,15 +701,13 @@ async def cancel_command(interaction: discord.Interaction):
         await interaction.followup.send("❌ You have no upcoming bookings to cancel.", ephemeral=True)
         return
     
-    # Build selection view with dynamic buttons
+    # Build selection view
     class SlotSelectView(discord.ui.View):
-        def __init__(self, slots_list):
-            super().__init__()
-            self.slots_list = slots_list
+        pass
     
-    view = SlotSelectView(slots)
+    view = SlotSelectView()
     
-    for idx, slot in enumerate(slots):
+    for slot in slots:
         day = slot['day']
         time_slot = slot['Time_Slot']
         label = f"{day} {time_slot}"
@@ -723,26 +721,33 @@ async def cancel_command(interaction: discord.Interaction):
                 )
                 return
             
-            # Simple confirmation with Yes/No buttons
+            # Confirmation view with programmatic buttons
             class ConfirmView(discord.ui.View):
                 def __init__(self):
                     super().__init__()
                     self.confirmed = None
+                
+                async def on_timeout(self):
+                    pass
             
             confirm_view = ConfirmView()
             
-            @discord.ui.button(label="YES, CANCEL IT", style=discord.ButtonStyle.danger)
-            async def yes_button(yes_interaction: discord.Interaction):
+            # Create buttons programmatically (not with decorator)
+            async def yes_callback(yes_interaction: discord.Interaction):
                 confirm_view.confirmed = True
                 await yes_interaction.response.defer()
             
-            @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
-            async def no_button(no_interaction: discord.Interaction):
+            async def no_callback(no_interaction: discord.Interaction):
                 confirm_view.confirmed = False
                 await no_interaction.response.defer()
             
-            confirm_view.add_item(yes_button)
-            confirm_view.add_item(no_button)
+            yes_btn = discord.ui.Button(label="YES, CANCEL IT", style=discord.ButtonStyle.danger)
+            yes_btn.callback = yes_callback
+            confirm_view.add_item(yes_btn)
+            
+            no_btn = discord.ui.Button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
+            no_btn.callback = no_callback
+            confirm_view.add_item(no_btn)
             
             embed = discord.Embed(
                 title="⚠️ Confirm Cancellation",
