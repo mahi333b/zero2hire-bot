@@ -466,7 +466,7 @@ def build_dashboard_embed(day):
     return embed
 
 # ============================================================================
-# PERSISTENT DASHBOARD VIEW
+# PERSISTENT DASHBOARD VIEW (Improved - Private View)
 # ============================================================================
 
 class DashboardView(discord.ui.View):
@@ -482,27 +482,30 @@ class DashboardView(discord.ui.View):
             btn = discord.ui.Button(
                 label=label,
                 style=discord.ButtonStyle.secondary,
-                custom_id=f"dash_day_{day_name}"
             )
             btn.callback = self._make_day_callback(day_name)
             self.add_item(btn)
 
     def _make_day_callback(self, day_name: str):
         async def callback(interaction: discord.Interaction):
-            global CURRENT_DASHBOARD_DAY
-            
-            async with STATE_LOCK:
-                CURRENT_DASHBOARD_DAY = day_name
-
-            await interaction.response.defer()
-            embed = build_dashboard_embed(day_name)
-            await interaction.message.edit(embed=embed, view=self)
+            try:
+                await interaction.response.defer(ephemeral=True)
+                embed = build_dashboard_embed(day_name)
+                
+                # Send private response only to the user who clicked
+                await interaction.followup.send(
+                    embed=embed, 
+                    view=DashboardView(),  # Fresh buttons
+                    ephemeral=True
+                )
+                
+                logger.info(f"{interaction.user} viewed {day_name} queue privately")
+                
+            except Exception as e:
+                logger.error(f"Error in dashboard button: {e}")
+                await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
 
         return callback
-
-    def refresh_buttons(self):
-        """Refresh buttons daily to keep Mon-Fri rolling window current."""
-        self._build_buttons()
 
 # ============================================================================
 # DISCORD BOT EVENTS
@@ -516,7 +519,7 @@ async def on_ready():
 
     # Initialize DASHBOARD_VIEW here so it runs inside the event loop
     DASHBOARD_VIEW = DashboardView()
-    bot.add_view(DASHBOARD_VIEW)
+    bot.add_view(DashboardView())   # Allow multiple instances
 
     for guild in bot.guilds:
         for channel in guild.channels:
@@ -786,7 +789,7 @@ async def update_dashboard():
                     return
 
         # Create new dashboard if not found
-        msg = await channel.send(embed=embed, view=DASHBOARD_VIEW)
+        msg = await channel.send(embed=embed, view=DashboardView())
         await msg.pin()
         async with STATE_LOCK:
             DASHBOARD_MESSAGE_ID = msg.id
