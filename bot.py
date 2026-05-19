@@ -40,6 +40,13 @@ DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 # Track confirmation reactions
 PENDING_CONFIRMATIONS = {}  # {f"{day}_{slot}": member_id}
 
+# Cache system - store Notion results to avoid repeated API calls
+CACHE = {
+    'bookings': None,
+    'timestamp': None,
+    'ttl': 5  # 5 seconds cache
+}
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
@@ -123,7 +130,19 @@ def query_notion_database():
         return []
 
 def get_all_bookings():
-    """Get all bookings from Notion"""
+    """Get all bookings from Notion - with caching"""
+    global CACHE
+    
+    now = datetime.now()
+    
+    # Check if cache is still valid
+    if CACHE['bookings'] is not None and CACHE['timestamp'] is not None:
+        elapsed = (now - CACHE['timestamp']).total_seconds()
+        if elapsed < CACHE['ttl']:
+            # Cache is still fresh, return cached data
+            return CACHE['bookings']
+    
+    # Cache expired or empty, fetch from Notion
     results = query_notion_database()
     bookings = []
     
@@ -142,6 +161,10 @@ def get_all_bookings():
             'Cancelled_At': props['Cancelled_At']['date']['start'] if props['Cancelled_At']['date'] else None,
         }
         bookings.append(booking)
+    
+    # Update cache
+    CACHE['bookings'] = bookings
+    CACHE['timestamp'] = now
     
     return bookings
 
@@ -185,6 +208,7 @@ def create_booking(member_id, member_name, day, time_slot):
                 "Booked_At": {"date": {"start": get_bd_time().isoformat()}},
             }
         )
+        invalidate_cache()  # Clear cache so new booking shows immediately
         return True
     except Exception as e:
         print(f"Error creating booking: {e}")
@@ -209,6 +233,7 @@ def update_booking_status(page_id, new_status, field_to_update=None, value=None)
                 update_dict["Duration_Minutes"] = {"number": value}
         
         notion.pages.update(page_id=page_id, properties=update_dict)
+        invalidate_cache()  # Clear cache so updates show immediately
         return True
     except Exception as e:
         print(f"Error updating booking: {e}")
@@ -250,8 +275,15 @@ def mark_slot_complete(member_id, day, time_slot):
             booking['Member_ID'] == str(member_id) and
             booking['Status'] == 'called'):
             update_booking_status(booking['id'], 'called', 'Duration_Minutes', 60)
+            invalidate_cache()  # Refresh cache immediately
             return True
     return False
+
+def invalidate_cache():
+    """Clear cache to force Notion refresh on next query"""
+    global CACHE
+    CACHE['bookings'] = None
+    CACHE['timestamp'] = None
 
 def get_member_slots(member_id):
     """Get only FUTURE active slots for a member"""
@@ -770,7 +802,7 @@ async def auto_complete_slots():
         except:
             pass
 
-@tasks.loop(seconds=2)
+@tasks.loop(seconds=1)
 async def update_dashboard():
     """Update dashboard"""
     global DASHBOARD_MESSAGE_ID, CURRENT_DASHBOARD_DAY
