@@ -91,35 +91,18 @@ def get_next_time_slot():
     return slot_map.get(next_hour)
 
 def query_notion_database(filters=None):
-    """Query Bookings database using search API"""
+    """Query Bookings database directly"""
     if not notion:
         return []
     
     try:
-        # Use search API to find pages in this database
-        response = notion.search(
-            filter={
-                "property": "object",
-                "value": "page"
-            },
-            sort={
-                "direction": "descending",
-                "timestamp": "last_edited_time"
-            },
+        response = notion.databases.query(
+            database_id=BOOKINGS_DATABASE_ID,
             page_size=100
         )
-        
-        # Filter to only pages in our database
-        results = []
-        for page in response.get('results', []):
-            if page.get('parent', {}).get('database_id') == BOOKINGS_DATABASE_ID:
-                results.append(page)
-        
-        return results
+        return response.get('results', [])
     except Exception as e:
         print(f"Error querying Notion: {e}")
-        import traceback
-        traceback.print_exc()
         return []
 
 def get_all_bookings():
