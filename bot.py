@@ -1,33 +1,28 @@
 import discord
 from discord.ext import commands, tasks
-import gspread
-from google.oauth2.service_account import Credentials
-import json
+from notion_client import Client
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import asyncio
 import pytz
+from typing import Optional, List, Dict
 
 load_dotenv()
 
 TOKEN = os.getenv('DISCORD_TOKEN')
-CREDENTIALS_JSON = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
+NOTION_TOKEN = os.getenv('NOTION_TOKEN')
+BOOKINGS_DATABASE_ID = os.getenv('BOOKINGS_DATABASE_ID')
 
 # Bangladesh timezone
 BD_TZ = pytz.timezone('Asia/Dhaka')
 
-# Parse credentials
+# Initialize Notion client
 try:
-    creds_dict = json.loads(CREDENTIALS_JSON)
-    creds = Credentials.from_service_account_info(
-        creds_dict,
-        scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    )
-    gc = gspread.authorize(creds)
+    notion = Client(auth=NOTION_TOKEN)
 except Exception as e:
-    print(f"Error loading credentials: {e}")
-    gc = None
+    print(f"Error initializing Notion: {e}")
+    notion = None
 
 # Discord bot setup
 intents = discord.Intents.default()
@@ -38,57 +33,26 @@ intents.reactions = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
 # Global variables
-SHEET_NAME = 'Zero2Hire_Schedule'
-CALLING_SHEET_TAB = 'Calling_Schedule'
-SUMMARY_SHEET_TAB = 'Summary'
 DIALING_QUEUE_CHANNEL_ID = None
-DASHBOARD_MESSAGE_ID = None
-CURRENT_DASHBOARD_DAY = None  # Track which day is currently displayed
+CURRENT_DASHBOARD_DAY = None
 
 TIME_SLOTS = ['7pm', '8pm', '9pm', '10pm', '11pm', '12am', '1am', '2am', '3am']
 DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 
-# Track turn announcements and reactions
-TURN_ANNOUNCEMENTS = {}  # {day_time: message_id}
-MEMBERS_REACTED = {}  # {day_time: member_id}
-NO_SHOWS_ANNOUNCED = {}  # {day_time: True}
+# Track turn announcements (clean up daily to prevent memory leak)
+TURN_ANNOUNCEMENTS = {}  # {day_slot: message_id}
+NO_SHOWS_ANNOUNCED = {}  # {day_slot: True}
 
 # ============================================================================
-# HELPER FUNCTIONS
+# NOTION HELPER FUNCTIONS
 # ============================================================================
-
-def get_sheet():
-    """Get the Google Sheet"""
-    try:
-        sh = gc.open(SHEET_NAME)
-        return sh
-    except Exception as e:
-        print(f"Error accessing sheet: {e}")
-        return None
-
-def get_calling_schedule_data():
-    """Fetch all data from Calling_Schedule tab"""
-    sheet = get_sheet()
-    if not sheet:
-        return []
-    try:
-        worksheet = sheet.worksheet(CALLING_SHEET_TAB)
-        return worksheet.get_all_records()
-    except Exception as e:
-        print(f"Error fetching schedule: {e}")
-        return []
 
 def get_bd_time():
     """Get current Bangladesh time"""
     return datetime.now(BD_TZ)
 
 def get_current_calling_day():
-    """
-    Get which day's calling window is currently active.
-    If hour is 0-3 (12am-3:59am), we're in yesterday's calling window.
-    If hour is 19-23 (7pm-11:59pm), we're in today's calling window.
-    Otherwise, no calling window.
-    """
+    """Get which day's calling window is currently active"""
     now = get_bd_time()
     hour = now.hour
     
@@ -103,14 +67,13 @@ def get_current_calling_day():
     return days[calling_day.weekday()]
 
 def get_calendar_day():
-    """Get current calendar day (Monday, Tuesday, etc.)"""
+    """Get current calendar day"""
     days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
     return days[get_bd_time().weekday()]
 
 def get_current_time_slot():
-    """Get current time slot (7pm, 8pm, etc.)"""
+    """Get current time slot"""
     hour = get_bd_time().hour
-    
     slot_map = {
         19: '7pm', 20: '8pm', 21: '9pm', 22: '10pm', 23: '11pm',
         0: '12am', 1: '1am', 2: '2am', 3: '3am'
@@ -119,153 +82,184 @@ def get_current_time_slot():
 
 def get_next_time_slot():
     """Get next time slot"""
-    current = get_bd_time()
-    hour = current.hour
-    
+    hour = get_bd_time().hour
     slot_map = {
         19: '7pm', 20: '8pm', 21: '9pm', 22: '10pm', 23: '11pm',
         0: '12am', 1: '1am', 2: '2am', 3: '3am'
     }
-    
     next_hour = (hour + 1) % 24
     return slot_map.get(next_hour)
 
-def is_slot_booked(day, time_slot):
-    """Check if a slot is already booked"""
-    data = get_calling_schedule_data()
-    for row in data:
-        if row.get('Date') == day and row.get('Time_Slot') == time_slot:
-            status = row.get('Status', '')
-            if status in ['called', 'booked']:
-                return True
-    return False
+def query_notion_database(filters=None):
+    """Query Bookings database with optional filters"""
+    if not notion:
+        return []
+    
+    try:
+        query_params = {
+            "database_id": BOOKINGS_DATABASE_ID,
+            "page_size": 100
+        }
+        
+        if filters:
+            query_params["filter"] = filters
+        
+        response = notion.databases.query(**query_params)
+        return response.get('results', [])
+    except Exception as e:
+        print(f"Error querying Notion: {e}")
+        return []
+
+def get_all_bookings():
+    """Get all bookings from Notion"""
+    results = query_notion_database()
+    bookings = []
+    
+    for page in results:
+        props = page['properties']
+        booking = {
+            'id': page['id'],
+            'day': props['day']['select']['name'] if props['day']['select'] else None,
+            'Time_Slot': props['Time_Slot']['select']['name'] if props['Time_Slot']['select'] else None,
+            'Member_ID': props['Member_ID']['rich_text'][0]['text']['content'] if props['Member_ID']['rich_text'] else None,
+            'Member_Name': props['Member_Name']['rich_text'][0]['text']['content'] if props['Member_Name']['rich_text'] else None,
+            'Status': props['Status']['select']['name'] if props['Status']['select'] else None,
+            'Booked_At': props['Booked_At']['date']['start'] if props['Booked_At']['date'] else None,
+            'Called_At': props['Called_At']['date']['start'] if props['Called_At']['date'] else None,
+            'Duration_Minutes': props['Duration_Minutes']['number'] if props['Duration_Minutes']['number'] else None,
+            'Cancelled_At': props['Cancelled_At']['date']['start'] if props['Cancelled_At']['date'] else None,
+        }
+        bookings.append(booking)
+    
+    return bookings
+
+def get_slot_booking(day, time_slot):
+    """Get booking for a specific slot - ATOMIC CHECK"""
+    bookings = get_all_bookings()
+    for booking in bookings:
+        if (booking['day'] == day and 
+            booking['Time_Slot'] == time_slot and 
+            booking['Status'] in ['booked', 'called']):
+            return booking
+    return None
 
 def member_has_slot_on_day(member_id, day):
-    """Check if member already has a slot booked on a specific day"""
-    data = get_calling_schedule_data()
-    for row in data:
-        if row.get('Date') == day and row.get('Member_ID') == str(member_id):
-            status = row.get('Status', '')
-            if status in ['booked', 'called']:
-                return True
+    """Check if member already has a slot on this day"""
+    bookings = get_all_bookings()
+    for booking in bookings:
+        if (booking['day'] == day and 
+            booking['Member_ID'] == str(member_id) and
+            booking['Status'] in ['booked', 'called']):
+            return True
     return False
 
-def book_slot(member_id, member_name, day, time_slot):
-    """Add a booking to Google Sheet"""
-    sheet = get_sheet()
-    if not sheet:
+def create_booking(member_id, member_name, day, time_slot):
+    """Create a new booking - ATOMIC OPERATION"""
+    if not notion:
         return False
+    
+    # Double-check slot is still free (race condition prevention)
+    if get_slot_booking(day, time_slot):
+        return False
+    
     try:
-        worksheet = sheet.worksheet(CALLING_SHEET_TAB)
-        now = get_bd_time().strftime('%a %I:%M%p')
-        worksheet.append_row([
-            day,
-            time_slot,
-            str(member_id),
-            member_name,
-            'booked',
-            now,
-            '',
-            '',
-            '',
-            ''
-        ])
+        notion.pages.create(
+            parent={"database_id": BOOKINGS_DATABASE_ID},
+            properties={
+                "day": {"select": {"name": day}},
+                "Time_Slot": {"select": {"name": time_slot}},
+                "Member_ID": {"rich_text": [{"text": {"content": str(member_id)}}]},
+                "Member_Name": {"rich_text": [{"text": {"content": str(member_name)}}]},
+                "Status": {"select": {"name": "booked"}},
+                "Booked_At": {"date": {"start": get_bd_time().isoformat()}},
+            }
+        )
         return True
     except Exception as e:
-        print(f"Error booking slot: {e}")
+        print(f"Error creating booking: {e}")
         return False
 
-def cancel_slot(member_id, day, time_slot):
-    """Cancel a booking"""
-    sheet = get_sheet()
-    if not sheet:
+def update_booking_status(page_id, new_status, field_to_update=None, value=None):
+    """Update booking status and optional other field"""
+    if not notion:
         return False
+    
     try:
-        worksheet = sheet.worksheet(CALLING_SHEET_TAB)
-        data = worksheet.get_all_records()
-        for i, row in enumerate(data):
-            if (row.get('Date') == day and 
-                row.get('Time_Slot') == time_slot and 
-                row.get('Member_ID') == str(member_id)):
-                worksheet.update_cell(i + 2, 5, 'cancelled')  # Status column
-                worksheet.update_cell(i + 2, 9, get_bd_time().strftime('%a %I:%M%p'))  # Cancelled_At
-                return True
-        return False
+        update_dict = {
+            "Status": {"select": {"name": new_status}}
+        }
+        
+        if field_to_update and value:
+            if field_to_update == "Called_At":
+                update_dict["Called_At"] = {"date": {"start": value}}
+            elif field_to_update == "Cancelled_At":
+                update_dict["Cancelled_At"] = {"date": {"start": value}}
+            elif field_to_update == "Duration_Minutes":
+                update_dict["Duration_Minutes"] = {"number": value}
+        
+        notion.pages.update(page_id=page_id, properties=update_dict)
+        return True
     except Exception as e:
-        print(f"Error cancelling slot: {e}")
+        print(f"Error updating booking: {e}")
         return False
+
+def cancel_slot_by_member(member_id, day, time_slot):
+    """Cancel a booking"""
+    bookings = get_all_bookings()
+    for booking in bookings:
+        if (booking['day'] == day and 
+            booking['Time_Slot'] == time_slot and 
+            booking['Member_ID'] == str(member_id)):
+            update_booking_status(
+                booking['id'], 
+                'cancelled',
+                'Cancelled_At',
+                get_bd_time().isoformat()
+            )
+            return True
+    return False
 
 def mark_as_called(member_id, day, time_slot):
-    """Mark a slot as 'called' when member reacts"""
-    sheet = get_sheet()
-    if not sheet:
-        return False
-    try:
-        worksheet = sheet.worksheet(CALLING_SHEET_TAB)
-        data = worksheet.get_all_records()
-        for i, row in enumerate(data):
-            if (row.get('Date') == day and 
-                row.get('Time_Slot') == time_slot and 
-                row.get('Member_ID') == str(member_id)):
-                worksheet.update_cell(i + 2, 5, 'called')  # Status
-                worksheet.update_cell(i + 2, 7, get_bd_time().strftime('%a %I:%M%p'))  # Called_At
-                return True
-        return False
-    except Exception as e:
-        print(f"Error marking as called: {e}")
-        return False
+    """Mark slot as called"""
+    bookings = get_all_bookings()
+    for booking in bookings:
+        if (booking['day'] == day and 
+            booking['Time_Slot'] == time_slot and 
+            booking['Member_ID'] == str(member_id)):
+            update_booking_status(
+                booking['id'],
+                'called',
+                'Called_At',
+                get_bd_time().isoformat()
+            )
+            return True
+    return False
 
 def mark_as_no_show(day, time_slot):
-    """Mark a slot as 'no-show'"""
-    sheet = get_sheet()
-    if not sheet:
-        return
-    try:
-        worksheet = sheet.worksheet(CALLING_SHEET_TAB)
-        data = worksheet.get_all_records()
-        for i, row in enumerate(data):
-            if (row.get('Date') == day and 
-                row.get('Time_Slot') == time_slot and 
-                row.get('Status') == 'booked'):
-                worksheet.update_cell(i + 2, 5, 'no-show')  # Status
-                return
-    except Exception as e:
-        print(f"Error marking no-show: {e}")
+    """Mark slot as no-show"""
+    bookings = get_all_bookings()
+    for booking in bookings:
+        if (booking['day'] == day and 
+            booking['Time_Slot'] == time_slot and 
+            booking['Status'] == 'booked'):
+            update_booking_status(booking['id'], 'no-show')
+            return True
+    return False
 
 def mark_slot_complete(member_id, day, time_slot):
-    """Mark slot as complete with duration"""
-    sheet = get_sheet()
-    if not sheet:
-        return
-    try:
-        worksheet = sheet.worksheet(CALLING_SHEET_TAB)
-        data = worksheet.get_all_records()
-        for i, row in enumerate(data):
-            if (row.get('Date') == day and 
-                row.get('Time_Slot') == time_slot and 
-                row.get('Member_ID') == str(member_id) and
-                row.get('Status') == 'called'):
-                worksheet.update_cell(i + 2, 8, 60)  # Duration in minutes
-                return
-    except Exception as e:
-        print(f"Error marking complete: {e}")
-
-def get_member_slots(member_id):
-    """Get all slots for a member"""
-    data = get_calling_schedule_data()
-    slots = []
-    for row in data:
-        if row.get('Member_ID') == str(member_id):
-            slots.append({
-                'day': row.get('Date'),
-                'time': row.get('Time_Slot'),
-                'status': row.get('Status'),
-                'name': row.get('Member_Name')
-            })
-    return slots
+    """Mark slot complete with 60-min duration"""
+    bookings = get_all_bookings()
+    for booking in bookings:
+        if (booking['day'] == day and 
+            booking['Time_Slot'] == time_slot and 
+            booking['Member_ID'] == str(member_id) and
+            booking['Status'] == 'called'):
+            update_booking_status(booking['id'], 'called', 'Duration_Minutes', 60)
+            return True
+    return False
 
 def can_cancel_slot(day, time_slot):
-    """Check if cancellation is allowed (3+ hours before slot)"""
+    """Check if 3+ hours before slot"""
     now = get_bd_time()
     
     slot_hours = {
@@ -277,33 +271,35 @@ def can_cancel_slot(day, time_slot):
     if slot_hour is None:
         return False
     
-    day_map = {d: i for i, d in enumerate(DAYS)}
-    slot_day_index = day_map.get(day)
-    
-    if slot_day_index is None:
-        return False
-    
-    # Create datetime for the slot
+    # Create datetime for slot
     slot_datetime = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
     
-    # If slot is in the past today, it's next week
+    # If slot is in the past, it's next occurrence
     if slot_datetime < now:
         slot_datetime += timedelta(days=7)
     
-    # Check if 3+ hours away
-    time_until_slot = slot_datetime - now
-    return time_until_slot.total_seconds() >= 3 * 3600
+    time_until = slot_datetime - now
+    return time_until.total_seconds() >= 3 * 3600
 
-def format_available_slots(day):
+def get_available_slots(day):
     """Get available slots for a day"""
     available = []
     for slot in TIME_SLOTS:
-        if not is_slot_booked(day, slot):
+        if not get_slot_booking(day, slot):
             available.append(slot)
     return available
 
+def get_member_slots(member_id):
+    """Get all slots for a member"""
+    bookings = get_all_bookings()
+    slots = []
+    for booking in bookings:
+        if booking['Member_ID'] == str(member_id):
+            slots.append(booking)
+    return slots
+
 def get_future_days(days_ahead=7):
-    """Get list of days from today to days_ahead (inclusive)"""
+    """Get list of days from today onwards"""
     today = get_bd_time()
     result = []
     for i in range(days_ahead):
@@ -319,7 +315,7 @@ def get_future_days(days_ahead=7):
 
 def build_dashboard_embed(day):
     """Build dashboard embed for a specific day"""
-    data = get_calling_schedule_data()
+    bookings = get_all_bookings()
     
     embed = discord.Embed(
         title="🎙️ ZERO2HIRE CALLING SCHEDULER",
@@ -329,16 +325,15 @@ def build_dashboard_embed(day):
     # Find who's live now
     live_member = None
     current_slot = get_current_time_slot()
+    calling_day = get_current_calling_day()
     
-    if current_slot:
-        calling_day = get_current_calling_day()
-        if calling_day:
-            for row in data:
-                if (row.get('Date') == calling_day and 
-                    row.get('Time_Slot') == current_slot and 
-                    row.get('Status') == 'called'):
-                    live_member = row.get('Member_Name', '')
-                    break
+    if current_slot and calling_day:
+        for booking in bookings:
+            if (booking['day'] == calling_day and 
+                booking['Time_Slot'] == current_slot and 
+                booking['Status'] == 'called'):
+                live_member = booking['Member_Name']
+                break
     
     if live_member:
         embed.add_field(
@@ -356,14 +351,13 @@ def build_dashboard_embed(day):
     # Find next caller
     next_slot = get_next_time_slot()
     next_member = None
-    calling_day = get_current_calling_day()
     
     if next_slot and calling_day:
-        for row in data:
-            if (row.get('Date') == calling_day and 
-                row.get('Time_Slot') == next_slot and 
-                row.get('Status') in ['booked', 'called']):
-                next_member = row.get('Member_Name', '')
+        for booking in bookings:
+            if (booking['day'] == calling_day and 
+                booking['Time_Slot'] == next_slot and 
+                booking['Status'] in ['booked', 'called']):
+                next_member = booking['Member_Name']
                 break
     
     if next_member:
@@ -379,16 +373,15 @@ def build_dashboard_embed(day):
             inline=False
         )
     
-    # Show all slots for the selected day
+    # Show all slots for selected day
     queue_text = ""
     for slot in TIME_SLOTS:
         booked_member = None
-        for row in data:
-            if (row.get('Date') == day and 
-                row.get('Time_Slot') == slot):
-                status = row.get('Status', '')
-                if status in ['booked', 'called']:
-                    booked_member = row.get('Member_Name', '')
+        for booking in bookings:
+            if (booking['day'] == day and 
+                booking['Time_Slot'] == slot and
+                booking['Status'] in ['booked', 'called']):
+                booked_member = booking['Member_Name']
                 break
         
         if booked_member:
@@ -424,51 +417,54 @@ async def on_ready():
                     DIALING_QUEUE_CHANNEL_ID = channel.id
                     break
         
-        print(f"Dialing queue channel ID: {DIALING_QUEUE_CHANNEL_ID}")
+        print(f"✅ Dialing queue channel ID: {DIALING_QUEUE_CHANNEL_ID}")
+        
+        if not DIALING_QUEUE_CHANNEL_ID:
+            print("❌ #dialing-queue channel not found!")
         
         CURRENT_DASHBOARD_DAY = get_calendar_day()
         
         try:
             synced = await bot.tree.sync()
-            print(f'Synced {len(synced)} command(s)')
+            print(f'✅ Synced {len(synced)} command(s)')
         except Exception as e:
-            print(f"Error syncing commands: {e}")
+            print(f"❌ Error syncing commands: {e}")
         
-        # Start background tasks with error handling
+        # Start background tasks
         try:
             if not update_dashboard.is_running():
                 update_dashboard.start()
-                print("✅ Dashboard task started")
+                print("✅ Dashboard task started (5-sec refresh)")
         except Exception as e:
-            print(f"❌ Error starting dashboard task: {e}")
+            print(f"❌ Dashboard task error: {e}")
         
         try:
             if not post_turn_announcements.is_running():
                 post_turn_announcements.start()
                 print("✅ Turn announcements task started")
         except Exception as e:
-            print(f"❌ Error starting turn announcements task: {e}")
+            print(f"❌ Turn announcements error: {e}")
         
         try:
             if not check_no_shows.is_running():
                 check_no_shows.start()
-                print("✅ No-shows task started")
+                print("✅ No-shows detection started")
         except Exception as e:
-            print(f"❌ Error starting no-shows task: {e}")
+            print(f"❌ No-shows error: {e}")
         
         try:
             if not check_slot_completion.is_running():
                 check_slot_completion.start()
-                print("✅ Slot completion task started")
+                print("✅ Slot completion started")
         except Exception as e:
-            print(f"❌ Error starting slot completion task: {e}")
+            print(f"❌ Slot completion error: {e}")
         
         try:
-            if not update_summary_tab.is_running():
-                update_summary_tab.start()
-                print("✅ Summary tab task started")
+            if not cleanup_memory.is_running():
+                cleanup_memory.start()
+                print("✅ Memory cleanup started (daily)")
         except Exception as e:
-            print(f"❌ Error starting summary tab task: {e}")
+            print(f"❌ Memory cleanup error: {e}")
         
         print("🚀 Bot fully initialized and ready!")
     except Exception as e:
@@ -478,47 +474,37 @@ async def on_ready():
 
 @bot.event
 async def on_reaction_add(reaction, user):
-    """Handle when a member reacts with ✅"""
-    # Ignore bot's own reactions
+    """Handle ✅ reactions to turn announcements"""
     if user == bot.user:
         return
     
-    # Only care about ✅ reactions
     if reaction.emoji != '✅':
         return
     
-    # Only in #dialing-queue
     if reaction.message.channel.id != DIALING_QUEUE_CHANNEL_ID:
         return
     
-    # Check if this is a turn announcement (has "YOUR TURN" or "SLOT OPEN" in embed)
     if not reaction.message.embeds:
         return
     
     embed = reaction.message.embeds[0]
-    if "YOUR TURN" not in embed.title and "SLOT OPEN" not in embed.title:
+    
+    # Get metadata from embed footer
+    footer_text = embed.footer.text if embed.footer else ""
+    
+    if not footer_text.startswith("day=") or not ("slot=" in footer_text):
         return
     
-    # Extract day and time from embed
-    description = embed.description or ""
-    
+    # Parse metadata: "day=Monday|slot=9pm"
+    parts = footer_text.split("|")
     day = None
     time_slot = None
     
-    for line in description.split('\n'):
-        if 'Slot:' in line or 'slot' in line.lower():
-            parts = line.split('Slot:')
-            if len(parts) > 1:
-                slot_info = parts[1].strip()
-                # Parse "Monday 9pm" format
-                for d in DAYS:
-                    if d in slot_info:
-                        day = d
-                        for t in TIME_SLOTS:
-                            if t in slot_info:
-                                time_slot = t
-                                break
-                        break
+    for part in parts:
+        if part.startswith("day="):
+            day = part.replace("day=", "")
+        elif part.startswith("slot="):
+            time_slot = part.replace("slot=", "")
     
     if not day or not time_slot:
         return
@@ -526,20 +512,15 @@ async def on_reaction_add(reaction, user):
     member_id = user.id
     member_name = str(user)
     
-    # Check if slot is still available
-    if is_slot_booked(day, time_slot):
+    # Check if slot is still free (race condition prevention)
+    if get_slot_booking(day, time_slot):
         await user.send(f"❌ The {day} {time_slot} slot was already claimed by someone else.")
         return
     
-    # Book the slot for this member
-    if book_slot(member_id, member_name, day, time_slot):
-        # Mark as called immediately
+    # Book the slot
+    if create_booking(member_id, member_name, day, time_slot):
         mark_as_called(member_id, day, time_slot)
         
-        # Update in-memory tracker
-        MEMBERS_REACTED[f"{day}_{time_slot}"] = member_id
-        
-        # Notify member
         embed_confirm = discord.Embed(
             title="✅ YOU'RE LIVE!",
             description=f"You're now calling the {day} {time_slot} slot!",
@@ -555,52 +536,43 @@ async def on_reaction_add(reaction, user):
 
 @bot.tree.command(name="book", description="Book a calling slot")
 async def book_command(interaction: discord.Interaction):
-    """Book a slot - opens interactive menu"""
+    """Book a slot"""
     await interaction.response.defer()
     
     member = interaction.user
     member_id = member.id
     
-    # Get future days (next 7 days)
     future_days = get_future_days(7)
-    
-    # Filter only Mon-Fri
     valid_days = [d for d in future_days if d['name'] in DAYS]
     
-    # Create day selector view instance
     class DayView(discord.ui.View):
-        selected_day = None
-        
         async def on_timeout(self):
             await interaction.followup.send("❌ Booking timed out.", ephemeral=True)
     
     day_view = DayView()
     
-    # Add day buttons to the view instance
     for day_obj in valid_days:
         day_name = day_obj['name']
         label = f"{day_name}" + (" (Today)" if day_obj['is_today'] else "")
         
         async def day_callback(interaction: discord.Interaction, d=day_name):
             await interaction.response.defer()
-            await show_time_slots(interaction, d, member_id)
+            await show_time_slots(interaction, d, member_id, member)
         
         button = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
         button.callback = day_callback
         day_view.add_item(button)
     
-    async def show_time_slots(interaction: discord.Interaction, day: str, mid: int):
-        """Show available time slots for selected day"""
-        
-        # Check if member already has a slot on this day
+    async def show_time_slots(interaction: discord.Interaction, day: str, mid: int, user):
+        """Show available times"""
         if member_has_slot_on_day(mid, day):
             await interaction.followup.send(
-                f"❌ You already have a slot booked for {day}. You can only book ONE slot per day.",
+                f"❌ You already have a slot booked for {day}. One slot per day!",
                 ephemeral=True
             )
             return
         
-        available = format_available_slots(day)
+        available = get_available_slots(day)
         
         if not available:
             await interaction.followup.send(
@@ -615,29 +587,37 @@ async def book_command(interaction: discord.Interaction):
         time_view = TimeView()
         
         for time_slot in available:
-            async def time_btn_callback(interaction: discord.Interaction, ts=time_slot, d=day):
-                if book_slot(mid, str(member), d, ts):
+            async def time_callback(interaction: discord.Interaction, ts=time_slot, d=day):
+                if create_booking(mid, str(user), d, ts):
                     embed = discord.Embed(
                         title="✅ CONFIRMED!",
                         description=f"You're booked for **{d} {ts}**.",
                         color=discord.Color.green()
                     )
-                    embed.add_field(name="📍 Calling window", value=f"{ts} Bangladesh Time", inline=False)
-                    embed.add_field(name="📢 What to do", value="When it's your turn, a message will appear in #dialing-queue.\nReact ✅ to mark yourself as calling!", inline=False)
+                    embed.add_field(
+                        name="📍 Calling window",
+                        value=f"{ts} Bangladesh Time",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="📢 What to do",
+                        value="Wait for announcement in #dialing-queue.\nReact ✅ when instructed!",
+                        inline=False
+                    )
                     await interaction.response.send_message(embed=embed, ephemeral=True)
                 else:
                     await interaction.response.send_message(
-                        f"❌ Error booking {d} {ts}. Someone else may have claimed it. Try another slot.",
+                        f"❌ Slot taken! Someone booked {d} {ts} just now. Try another.",
                         ephemeral=True
                     )
             
             button = discord.ui.Button(label=time_slot, style=discord.ButtonStyle.success)
-            button.callback = time_btn_callback
+            button.callback = time_callback
             time_view.add_item(button)
         
         embed = discord.Embed(
             title=f"📅 Available slots for {day}",
-            description="Select a time to book:",
+            description="Select a time:",
             color=discord.Color.blue()
         )
         await interaction.followup.send(embed=embed, view=time_view, ephemeral=True)
@@ -651,53 +631,43 @@ async def book_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="cancel", description="Cancel your booking")
 async def cancel_command(interaction: discord.Interaction, day: str, time: str):
-    """Cancel a booked slot"""
+    """Cancel a slot"""
     member = interaction.user
     member_id = member.id
     
-    # Validate inputs
     if day not in DAYS or time not in TIME_SLOTS:
-        await interaction.response.send_message(
-            "❌ Invalid day or time.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ Invalid day or time.", ephemeral=True)
         return
     
-    # Check if member has this slot
     member_slots = get_member_slots(member_id)
-    if not any(s['day'] == day and s['time'] == time for s in member_slots):
-        await interaction.response.send_message(
-            f"❌ You don't have {day} {time} booked.",
-            ephemeral=True
-        )
+    if not any(s['day'] == day and s['Time_Slot'] == time for s in member_slots):
+        await interaction.response.send_message(f"❌ You don't have {day} {time} booked.", ephemeral=True)
         return
     
-    # Check if cancellation is allowed
     if not can_cancel_slot(day, time):
         await interaction.response.send_message(
-            f"❌ Too late to cancel. Must cancel 3+ hours before slot start.",
+            "❌ Too late to cancel. Must cancel 3+ hours before slot.",
             ephemeral=True
         )
         return
     
-    # Confirm cancellation
     class ConfirmView(discord.ui.View):
         result = None
         
         @discord.ui.button(label="CONFIRM CANCEL", style=discord.ButtonStyle.danger)
-        async def confirm_btn(self, button: discord.ui.Button, interaction: discord.Interaction):
+        async def confirm(self, button: discord.ui.Button, i: discord.Interaction):
             self.result = True
-            await interaction.response.defer()
+            await i.response.defer()
         
         @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
-        async def keep_btn(self, button: discord.ui.Button, interaction: discord.Interaction):
+        async def keep(self, button: discord.ui.Button, i: discord.Interaction):
             self.result = False
-            await interaction.response.defer()
+            await i.response.defer()
     
     view = ConfirmView()
     embed = discord.Embed(
         title="⚠️ Cancel Booking?",
-        description=f"Are you sure you want to cancel **{day} {time}**?",
+        description=f"Cancel **{day} {time}**?",
         color=discord.Color.orange()
     )
     
@@ -705,8 +675,7 @@ async def cancel_command(interaction: discord.Interaction, day: str, time: str):
     await asyncio.sleep(60)
     
     if view.result:
-        if cancel_slot(member_id, day, time):
-            # Announce in dialing-queue
+        if cancel_slot_by_member(member_id, day, time):
             channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
             if channel:
                 embed = discord.Embed(
@@ -716,12 +685,10 @@ async def cancel_command(interaction: discord.Interaction, day: str, time: str):
                 )
                 embed.add_field(name="Slot Info", value=f"⏰ Slot: {day} {time}", inline=False)
                 embed.add_field(name="React ✅", value="to claim this slot!", inline=False)
+                embed.set_footer(text=f"day={day}|slot={time}")
                 await channel.send(embed=embed)
             
-            await interaction.followup.send(
-                f"✅ **Cancelled!**\nYour {day} {time} slot has been released.",
-                ephemeral=True
-            )
+            await interaction.followup.send(f"✅ **Cancelled!** {day} {time} released.", ephemeral=True)
         else:
             await interaction.followup.send("❌ Error cancelling. Try again.", ephemeral=True)
     else:
@@ -729,7 +696,7 @@ async def cancel_command(interaction: discord.Interaction, day: str, time: str):
 
 @bot.tree.command(name="myslot", description="See your booked slots")
 async def myslot_command(interaction: discord.Interaction):
-    """Show member's booked slots"""
+    """Show member's slots"""
     member = interaction.user
     member_id = member.id
     slots = get_member_slots(member_id)
@@ -743,14 +710,14 @@ async def myslot_command(interaction: discord.Interaction):
     else:
         embed = discord.Embed(
             title="📅 Your Booked Slots",
-            description="Your upcoming calling slots:",
+            description="Your calling slots:",
             color=discord.Color.blue()
         )
         for slot in slots:
-            emoji = "✅" if slot['status'] == 'booked' else "🔴" if slot['status'] == 'called' else "❌"
+            emoji = "✅" if slot['Status'] == 'booked' else "🔴" if slot['Status'] == 'called' else "⚠️"
             embed.add_field(
-                name=f"{emoji} {slot['day']} {slot['time']}",
-                value=f"Status: {slot['status']}",
+                name=f"{emoji} {slot['day']} {slot['Time_Slot']}",
+                value=f"Status: {slot['Status']}",
                 inline=False
             )
     
@@ -758,35 +725,30 @@ async def myslot_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="help", description="Show help")
 async def help_command(interaction: discord.Interaction):
-    """Show help message"""
+    """Show help"""
     embed = discord.Embed(
         title="📚 Zero2Hire Calling Scheduler - Help",
-        description="How to book and manage your calling slots",
+        description="How to use the bot",
         color=discord.Color.blue()
     )
     embed.add_field(
         name="/book",
-        value="Book a 1-hour calling slot (7pm–3am, Mon–Fri)\nYou can only book ONE slot per day",
+        value="Book a 1-hour slot (7pm–3am, Mon–Fri)\nOne slot per day!",
         inline=False
     )
     embed.add_field(
         name="/cancel [day] [time]",
-        value="Cancel a booked slot (must be 3+ hours before)",
+        value="Cancel a slot (3+ hours before)",
         inline=False
     )
     embed.add_field(
         name="/myslot",
-        value="See all your booked slots",
+        value="See your booked slots",
         inline=False
     )
     embed.add_field(
-        name="📍 How Calling Works",
-        value="1. Book a slot\n2. 30 min before, an announcement appears in #dialing-queue\n3. When it's your turn, react ✅ to the message\n4. Dashboard shows you're live\n5. Call for 1 hour",
-        inline=False
-    )
-    embed.add_field(
-        name="⚠️ No-Shows",
-        value="If you don't react ✅ within 10 min of your slot, it opens for others.",
+        name="📍 How it works",
+        value="1. Book via /book\n2. Get announcement 30 min before\n3. React ✅ when it's your turn\n4. Call for 1 hour",
         inline=False
     )
     
@@ -798,7 +760,7 @@ async def help_command(interaction: discord.Interaction):
 
 @tasks.loop(minutes=1)
 async def post_turn_announcements():
-    """Post turn announcements 30 min before AND at slot start time"""
+    """Post turn announcements 30 min before and at slot start"""
     if not DIALING_QUEUE_CHANNEL_ID:
         return
     
@@ -810,7 +772,7 @@ async def post_turn_announcements():
     if not channel:
         return
     
-    # Check at X:30 (30 minutes before the next hour)
+    # 30 minutes before
     if current_minute == 30:
         next_hour = (current_hour + 1) % 24
         slot_map = {
@@ -825,35 +787,26 @@ async def post_turn_announcements():
                 announcement_key = f"{calling_day}_{next_slot}_30min"
                 
                 if announcement_key not in TURN_ANNOUNCEMENTS:
-                    data = get_calling_schedule_data()
-                    for row in data:
-                        if (row.get('Date') == calling_day and 
-                            row.get('Time_Slot') == next_slot and 
-                            row.get('Status') in ['booked', 'called']):
-                            member_name = row.get('Member_Name', 'Unknown')
-                            
-                            try:
-                                embed = discord.Embed(
-                                    title=f"⏰ {next_slot.upper()} — YOUR TURN IN 30 MIN!",
-                                    description=f"**{member_name}** — Get ready! Your slot starts in 30 minutes.",
-                                    color=discord.Color.blue()
-                                )
-                                embed.add_field(
-                                    name="📍 Slot Info",
-                                    value=f"⏰ Slot: {calling_day} {next_slot}",
-                                    inline=False
-                                )
-                                embed.add_field(
-                                    name="📢 What to do",
-                                    value="React ✅ below when you're ready at slot time.\nYou'll get another message when it's time!",
-                                    inline=False
-                                )
-                                msg = await channel.send(embed=embed)
-                                TURN_ANNOUNCEMENTS[announcement_key] = msg.id
-                            except Exception as e:
-                                print(f"Error posting 30-min announcement: {e}")
+                    booking = get_slot_booking(calling_day, next_slot)
+                    if booking:
+                        try:
+                            embed = discord.Embed(
+                                title=f"⏰ {next_slot.upper()} — YOUR TURN IN 30 MIN!",
+                                description=f"**{booking['Member_Name']}** — Get ready!",
+                                color=discord.Color.blue()
+                            )
+                            embed.add_field(
+                                name="📍 Slot Info",
+                                value=f"{calling_day} {next_slot}",
+                                inline=False
+                            )
+                            embed.set_footer(text=f"day={calling_day}|slot={next_slot}")
+                            msg = await channel.send(embed=embed)
+                            TURN_ANNOUNCEMENTS[announcement_key] = msg.id
+                        except Exception as e:
+                            print(f"Error posting 30-min announcement: {e}")
     
-    # Check at X:00 (slot start time)
+    # At slot start
     elif current_minute == 0:
         slot_map = {
             19: '7pm', 20: '8pm', 21: '9pm', 22: '10pm', 23: '11pm',
@@ -867,37 +820,28 @@ async def post_turn_announcements():
                 announcement_key = f"{calling_day}_{current_slot}_now"
                 
                 if announcement_key not in TURN_ANNOUNCEMENTS:
-                    data = get_calling_schedule_data()
-                    for row in data:
-                        if (row.get('Date') == calling_day and 
-                            row.get('Time_Slot') == current_slot and 
-                            row.get('Status') in ['booked', 'called']):
-                            member_name = row.get('Member_Name', 'Unknown')
-                            
-                            try:
-                                embed = discord.Embed(
-                                    title=f"🎙️ {current_slot.upper()} — YOUR TURN NOW!",
-                                    description=f"**{member_name}** — It's your turn!",
-                                    color=discord.Color.green()
-                                )
-                                embed.add_field(
-                                    name="📍 Slot Info",
-                                    value=f"⏰ Slot: {calling_day} {current_slot}",
-                                    inline=False
-                                )
-                                embed.add_field(
-                                    name="⚡ React ✅ NOW",
-                                    value="React with ✅ below to mark yourself as live and start calling!",
-                                    inline=False
-                                )
-                                msg = await channel.send(embed=embed)
-                                TURN_ANNOUNCEMENTS[announcement_key] = msg.id
-                            except Exception as e:
-                                print(f"Error posting now announcement: {e}")
+                    booking = get_slot_booking(calling_day, current_slot)
+                    if booking:
+                        try:
+                            embed = discord.Embed(
+                                title=f"🎙️ {current_slot.upper()} — YOUR TURN NOW!",
+                                description=f"**{booking['Member_Name']}** — It's your turn!",
+                                color=discord.Color.green()
+                            )
+                            embed.add_field(
+                                name="⚡ React ✅ NOW",
+                                value="React below to mark yourself as live!",
+                                inline=False
+                            )
+                            embed.set_footer(text=f"day={calling_day}|slot={current_slot}")
+                            msg = await channel.send(embed=embed)
+                            TURN_ANNOUNCEMENTS[announcement_key] = msg.id
+                        except Exception as e:
+                            print(f"Error posting now announcement: {e}")
 
 @tasks.loop(minutes=1)
 async def check_no_shows():
-    """Check for no-shows (10 min after slot start with no reaction) - NO DM SENT"""
+    """Check for no-shows at X:10"""
     if not DIALING_QUEUE_CHANNEL_ID:
         return
     
@@ -905,7 +849,6 @@ async def check_no_shows():
     current_hour = now.hour
     current_minute = now.minute
     
-    # Check if we're at X:10 (10 minutes into an hour slot)
     if current_minute != 10:
         return
     
@@ -924,66 +867,42 @@ async def check_no_shows():
     
     announcement_key = f"{calling_day}_{current_slot}"
     
-    # Only announce no-show once
     if announcement_key in NO_SHOWS_ANNOUNCED:
         return
     
-    # Check if member has reacted
-    if announcement_key in MEMBERS_REACTED:
+    booking = get_slot_booking(calling_day, current_slot)
+    if not booking or booking['Status'] != 'booked':
         return
     
-    # Check who should have started this slot
-    data = get_calling_schedule_data()
-    for row in data:
-        if row.get('Date') == calling_day and row.get('Time_Slot') == current_slot:
-            status = row.get('Status', '')
-            member_name = row.get('Member_Name', '')
-            
-            if status == 'booked':
-                # Mark as no-show
-                mark_as_no_show(calling_day, current_slot)
-                NO_SHOWS_ANNOUNCED[announcement_key] = True
-                
-                try:
-                    # Announce in #dialing-queue ONLY (NO DM)
-                    channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
-                    if channel:
-                        embed = discord.Embed(
-                            title=f"⚠️ SLOT OPEN: {current_slot}",
-                            description=f"**{member_name}** didn't show up for their {current_slot} slot.",
-                            color=discord.Color.orange()
-                        )
-                        embed.add_field(
-                            name="📍 Slot Info",
-                            value=f"⏰ Slot: {calling_day} {current_slot}",
-                            inline=False
-                        )
-                        embed.add_field(
-                            name="⏳ Time remaining",
-                            value=f"50 minutes (slot ends at next hour)",
-                            inline=False
-                        )
-                        embed.add_field(
-                            name="React ✅",
-                            value="to claim this slot and start calling!",
-                            inline=False
-                        )
-                        await channel.send(embed=embed)
-                except Exception as e:
-                    print(f"Error handling no-show: {e}")
+    # Mark as no-show
+    mark_as_no_show(calling_day, current_slot)
+    NO_SHOWS_ANNOUNCED[announcement_key] = True
+    
+    try:
+        channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
+        if channel:
+            embed = discord.Embed(
+                title=f"⚠️ SLOT OPEN: {current_slot}",
+                description=f"**{booking['Member_Name']}** didn't show up.",
+                color=discord.Color.orange()
+            )
+            embed.add_field(name="⏳ Time remaining", value="50 minutes left", inline=False)
+            embed.add_field(name="React ✅", value="to claim this slot!", inline=False)
+            embed.set_footer(text=f"day={calling_day}|slot={current_slot}")
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Error handling no-show: {e}")
 
 @tasks.loop(minutes=1)
 async def check_slot_completion():
-    """Check if slots have completed and mark them done"""
+    """Mark slots complete after 60 minutes"""
     now = get_bd_time()
     current_hour = now.hour
     current_minute = now.minute
     
-    # Check at the top of each hour (X:00)
     if current_minute != 0:
         return
     
-    # Get the previous hour's slot (the one that just ended)
     if current_hour == 0:
         prev_hour = 23
     else:
@@ -998,52 +917,31 @@ async def check_slot_completion():
     if not completed_slot:
         return
     
-    # Get the calling day for the completed slot
     calling_day = get_current_calling_day()
     if not calling_day:
-        # If we're outside the calling window, use calendar day
         calling_day = get_calendar_day()
     
-    # Mark slot as complete in sheet
-    sheet = get_sheet()
-    if sheet:
+    booking = get_slot_booking(calling_day, completed_slot)
+    if booking and booking['Status'] == 'called':
+        mark_slot_complete(booking['Member_ID'], calling_day, completed_slot)
+        
         try:
-            worksheet = sheet.worksheet(CALLING_SHEET_TAB)
-            data = worksheet.get_all_records()
-            for i, row in enumerate(data):
-                if (row.get('Date') == calling_day and 
-                    row.get('Time_Slot') == completed_slot and 
-                    row.get('Status') == 'called'):
-                    # Set duration to 60 minutes
-                    mark_slot_complete(row.get('Member_ID'), calling_day, completed_slot)
+            channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
+            if channel:
+                embed = discord.Embed(
+                    title="✅ Slot Completed!",
+                    description=f"**{booking['Member_Name']}** finished their {completed_slot} session!",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="💪", value="Great work!", inline=False)
+                await channel.send(embed=embed)
         except Exception as e:
-            print(f"Error completing slot: {e}")
-    
-    # Announce completion
-    try:
-        channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
-        if channel:
-            data = get_calling_schedule_data()
-            for row in data:
-                if (row.get('Date') == calling_day and 
-                    row.get('Time_Slot') == completed_slot and 
-                    row.get('Status') == 'called'):
-                    member_name = row.get('Member_Name', '')
-                    embed = discord.Embed(
-                        title=f"✅ Slot Completed!",
-                        description=f"**{member_name}** finished their {completed_slot} calling session!",
-                        color=discord.Color.green()
-                    )
-                    embed.add_field(name="💪", value="Great work! Keep it up!", inline=False)
-                    await channel.send(embed=embed)
-                    break
-    except Exception as e:
-        print(f"Error announcing completion: {e}")
+            print(f"Error announcing completion: {e}")
 
-@tasks.loop(seconds=10)
+@tasks.loop(seconds=5)
 async def update_dashboard():
-    """Update the pinned dashboard every 10 seconds with 7-day navigation"""
-    global DASHBOARD_MESSAGE_ID, CURRENT_DASHBOARD_DAY
+    """Update dashboard every 5 seconds - FASTER!"""
+    global CURRENT_DASHBOARD_DAY
     
     if not DIALING_QUEUE_CHANNEL_ID:
         return
@@ -1053,100 +951,62 @@ async def update_dashboard():
         return
     
     try:
-        # Get the day to display (default to today)
         if not CURRENT_DASHBOARD_DAY:
             CURRENT_DASHBOARD_DAY = get_calendar_day()
         
-        # Build embed for the current displayed day
         embed = build_dashboard_embed(CURRENT_DASHBOARD_DAY)
         
-        # Create day navigation view instance
-        class DayNavigationView(discord.ui.View):
-            async def on_timeout(self):
-                pass
+        class DayNav(discord.ui.View):
+            pass
         
-        view = DayNavigationView()
+        view = DayNav()
         
-        # Get all future days (7 days)
         future_days = get_future_days(7)
         valid_days = [d for d in future_days if d['name'] in DAYS]
         
-        # Add buttons for each day to the view instance
         for day_obj in valid_days:
             day_name = day_obj['name']
             label = f"{day_name}" + (" (Today)" if day_obj['is_today'] else "")
             
-            async def day_btn_callback(interaction: discord.Interaction, d=day_name):
+            async def day_btn(interaction: discord.Interaction, d=day_name):
                 global CURRENT_DASHBOARD_DAY
                 CURRENT_DASHBOARD_DAY = d
                 await interaction.response.defer()
             
             button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
-            button.callback = day_btn_callback
+            button.callback = day_btn
             view.add_item(button)
         
-        # Try to find and edit existing pinned message
+        # Find and edit existing message
         found = False
-        async for msg in channel.history(limit=20):
+        async for msg in channel.history(limit=10):
             if msg.author == bot.user and msg.embeds:
                 if "ZERO2HIRE CALLING SCHEDULER" in msg.embeds[0].title:
                     await msg.edit(embed=embed, view=view)
                     found = True
-                    DASHBOARD_MESSAGE_ID = msg.id
                     break
         
-        # If no existing message, send a new one and pin it
+        # If not found, create new pinned message
         if not found:
             msg = await channel.send(embed=embed, view=view)
             await msg.pin()
-            DASHBOARD_MESSAGE_ID = msg.id
     
     except Exception as e:
         print(f"Error updating dashboard: {e}")
 
-@tasks.loop(hours=1)
-async def update_summary_tab():
-    """Update the Summary tab with session counts per member"""
-    sheet = get_sheet()
-    if not sheet:
-        return
+@tasks.loop(hours=24)
+async def cleanup_memory():
+    """Clean up old tracking dicts daily - prevent memory leaks"""
+    global TURN_ANNOUNCEMENTS, NO_SHOWS_ANNOUNCED
     
-    try:
-        # Get all calling data
-        worksheet = sheet.worksheet(CALLING_SHEET_TAB)
-        data = worksheet.get_all_records()
-        
-        # Count sessions per member
-        member_sessions = {}
-        for row in data:
-            if row.get('Status') == 'called':
-                member_id = row.get('Member_ID', '')
-                member_name = row.get('Member_Name', '')
-                
-                if member_id not in member_sessions:
-                    member_sessions[member_id] = {
-                        'name': member_name,
-                        'count': 0
-                    }
-                member_sessions[member_id]['count'] += 1
-        
-        # Update Summary tab
-        summary_worksheet = sheet.worksheet(SUMMARY_SHEET_TAB)
-        summary_worksheet.clear()
-        
-        # Add headers
-        summary_worksheet.append_row(['Member_ID', 'Member_Name', 'Total_Sessions', 'Last_Called'])
-        
-        # Add data
-        for member_id, info in member_sessions.items():
-            summary_worksheet.append_row([
-                member_id,
-                info['name'],
-                info['count'],
-                get_bd_time().strftime('%a %I:%M%p')
-            ])
-    except Exception as e:
-        print(f"Error updating summary tab: {e}")
+    # Keep only recent 100 entries
+    if len(TURN_ANNOUNCEMENTS) > 100:
+        TURN_ANNOUNCEMENTS = dict(list(TURN_ANNOUNCEMENTS.items())[-100:])
+    
+    if len(NO_SHOWS_ANNOUNCED) > 100:
+        NO_SHOWS_ANNOUNCED = dict(list(NO_SHOWS_ANNOUNCED.items())[-100:])
+    
+    print(f"✅ Memory cleaned up. Tracking {len(TURN_ANNOUNCEMENTS)} announcements.")
 
 # ============================================================================
 # RUN BOT
