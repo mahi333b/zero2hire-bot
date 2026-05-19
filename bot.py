@@ -97,3 +97,9 @@ CACHE = {
     'timestamp': None,
     'ttl': 10  # seconds
 }
+if __name__ == '__main__':
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        logger.error(f"❌ Failed to start bot: {e}")
+        raise
