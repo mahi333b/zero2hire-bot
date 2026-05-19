@@ -34,7 +34,7 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 
 # Global variables
 DIALING_QUEUE_CHANNEL_ID = None
-DASHBOARD_MESSAGE_ID = None  # ✅ FIX: Track dashboard message ID to prevent duplicates
+DASHBOARD_MESSAGE_ID = None
 
 TIME_SLOTS = ['7pm', '8pm', '9pm', '10pm', '11pm', '12am', '1am', '2am', '3am']
 DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
@@ -273,7 +273,6 @@ def mark_slot_complete(member_id, day, time_slot):
             return True
     return False
 
-# ✅ FIX: Rewritten to use day parameter properly
 def can_cancel_slot(day, time_slot):
     """Check if 3+ hours before slot"""
     now = get_bd_time()
@@ -314,7 +313,6 @@ def get_available_slots(day):
             available.append(slot)
     return available
 
-# ✅ FIX: Show only future, active bookings
 def get_member_slots(member_id):
     """Get only FUTURE active slots for a member (booked or called status)"""
     bookings = get_all_bookings()
@@ -434,7 +432,7 @@ def build_dashboard_embed(day):
             inline=False
         )
     
-    # Show all slots for selected day (TODAY ONLY NOW)
+    # Show all slots for selected day
     queue_text = ""
     for slot in TIME_SLOTS:
         booked_member = None
@@ -688,7 +686,6 @@ async def book_command(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=embed, view=day_view, ephemeral=True)
 
-# ✅ FIX: Completely rebuilt - interactive slot selection with proper button callbacks
 @bot.tree.command(name="cancel", description="Cancel your booking")
 async def cancel_command(interaction: discord.Interaction):
     """Cancel a slot - interactive version"""
@@ -707,9 +704,6 @@ async def cancel_command(interaction: discord.Interaction):
     # Build selection view
     class SlotSelectView(discord.ui.View):
         selected_slot = None
-        
-        async def on_timeout(self):
-            await interaction.followup.send("❌ Cancellation timed out.", ephemeral=True)
     
     view = SlotSelectView()
     
@@ -718,7 +712,7 @@ async def cancel_command(interaction: discord.Interaction):
         time_slot = slot['Time_Slot']
         label = f"{day} {time_slot}"
         
-        async def select_callback(interaction: discord.Interaction, d=day, ts=time_slot, slot_id=slot['id']):
+        async def select_callback(interaction: discord.Interaction, d=day, ts=time_slot):
             # Check if can cancel
             if not can_cancel_slot(d, ts):
                 await interaction.response.send_message(
@@ -727,18 +721,22 @@ async def cancel_command(interaction: discord.Interaction):
                 )
                 return
             
-           class ConfirmView(discord.ui.View):
-    result = None
-    
-    @discord.ui.button(label="CONFIRM CANCEL", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction):
-        self.result = True
-        await interaction.response.defer()
-    
-    @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
-    async def keep(self, interaction: discord.Interaction):
-        self.result = False
-        await interaction.response.defer()
+            # Confirm cancellation
+            class ConfirmView(discord.ui.View):
+                result = None
+                
+                @discord.ui.button(label="CONFIRM CANCEL", style=discord.ButtonStyle.danger)
+                async def confirm(self, button_interaction: discord.Interaction):
+                    self.result = True
+                    await button_interaction.response.defer()
+                
+                @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
+                async def keep(self, button_interaction: discord.Interaction):
+                    self.result = False
+                    await button_interaction.response.defer()
+            
+            confirm_view = ConfirmView()
+            embed = discord.Embed(
                 title="⚠️ Confirm Cancellation",
                 description=f"Cancel **{d} {ts}**?",
                 color=discord.Color.orange()
@@ -785,7 +783,7 @@ async def myslot_command(interaction: discord.Interaction):
     """Show member's FUTURE slots only"""
     member = interaction.user
     member_id = member.id
-    slots = get_member_slots(member_id)  # ✅ FIX: Now returns only future active slots
+    slots = get_member_slots(member_id)
     
     if not slots:
         embed = discord.Embed(
@@ -1024,7 +1022,6 @@ async def check_slot_completion():
         except Exception as e:
             print(f"Error announcing completion: {e}")
 
-# ✅ FIX: Faster refresh (2 seconds) + message ID tracking to prevent duplicates
 @tasks.loop(seconds=2)
 async def update_dashboard():
     """Update dashboard every 2 seconds"""
@@ -1038,7 +1035,6 @@ async def update_dashboard():
         return
     
     try:
-        # Always show TODAY'S queue (removed day navigation)
         today = get_calendar_day()
         embed = build_dashboard_embed(today)
         
