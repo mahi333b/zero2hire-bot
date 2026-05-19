@@ -91,16 +91,36 @@ def get_next_time_slot():
     return slot_map.get(next_hour)
 
 def query_notion_database(filters=None):
-    """Query Bookings database directly"""
+    """Query Bookings database"""
     if not notion:
         return []
-    
+
     try:
-        response = notion.databases.query(
-            database_id=BOOKINGS_DATABASE_ID,
-            page_size=100
-        )
-        return response.get('results', [])
+        results = []
+        has_more = True
+        start_cursor = None
+
+        while has_more:
+            kwargs = {
+                "filter": {"property": "object", "value": "page"},
+                "page_size": 100
+            }
+            if start_cursor:
+                kwargs["start_cursor"] = start_cursor
+
+            response = notion.search(**kwargs)
+
+            for page in response.get('results', []):
+                parent = page.get('parent', {})
+                db_id = parent.get('database_id', '').replace('-', '')
+                target_id = BOOKINGS_DATABASE_ID.replace('-', '')
+                if db_id == target_id:
+                    results.append(page)
+
+            has_more = response.get('has_more', False)
+            start_cursor = response.get('next_cursor')
+
+        return results
     except Exception as e:
         print(f"Error querying Notion: {e}")
         return []
@@ -935,7 +955,7 @@ async def check_slot_completion():
 
 @tasks.loop(seconds=5)
 async def update_dashboard():
-    """Update dashboard every 5 seconds - FASTER!"""
+    """Update dashboard every 5 seconds"""
     global CURRENT_DASHBOARD_DAY
     
     if not DIALING_QUEUE_CHANNEL_ID:
@@ -994,7 +1014,6 @@ async def cleanup_memory():
     """Clean up old tracking dicts daily - prevent memory leaks"""
     global TURN_ANNOUNCEMENTS, NO_SHOWS_ANNOUNCED
     
-    # Keep only recent 100 entries
     if len(TURN_ANNOUNCEMENTS) > 100:
         TURN_ANNOUNCEMENTS = dict(list(TURN_ANNOUNCEMENTS.items())[-100:])
     
