@@ -701,71 +701,82 @@ async def cancel_command(interaction: discord.Interaction):
         await interaction.followup.send("❌ You have no upcoming bookings to cancel.", ephemeral=True)
         return
     
-    # Build selection view
+    # Build selection view with dynamic buttons
     class SlotSelectView(discord.ui.View):
-        selected_slot = None
+        def __init__(self, slots_list):
+            super().__init__()
+            self.slots_list = slots_list
     
-    view = SlotSelectView()
+    view = SlotSelectView(slots)
     
-    for slot in slots:
+    for idx, slot in enumerate(slots):
         day = slot['day']
         time_slot = slot['Time_Slot']
         label = f"{day} {time_slot}"
         
-        async def select_callback(interaction: discord.Interaction, d=day, ts=time_slot):
+        async def select_callback(select_interaction: discord.Interaction, d=day, ts=time_slot, mid=member_id):
             # Check if can cancel
             if not can_cancel_slot(d, ts):
-                await interaction.response.send_message(
+                await select_interaction.response.send_message(
                     "❌ Too late to cancel. Must cancel 3+ hours before slot.",
                     ephemeral=True
                 )
                 return
             
-            # Confirm cancellation
+            # Simple confirmation with Yes/No buttons
             class ConfirmView(discord.ui.View):
-                result = None
-                
-                @discord.ui.button(label="CONFIRM CANCEL", style=discord.ButtonStyle.danger)
-                async def confirm(self, button_interaction: discord.Interaction):
-                    self.result = True
-                    await button_interaction.response.defer()
-                
-                @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
-                async def keep(self, button_interaction: discord.Interaction):
-                    self.result = False
-                    await button_interaction.response.defer()
+                def __init__(self):
+                    super().__init__()
+                    self.confirmed = None
             
             confirm_view = ConfirmView()
+            
+            @discord.ui.button(label="YES, CANCEL IT", style=discord.ButtonStyle.danger)
+            async def yes_button(yes_interaction: discord.Interaction):
+                confirm_view.confirmed = True
+                await yes_interaction.response.defer()
+            
+            @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
+            async def no_button(no_interaction: discord.Interaction):
+                confirm_view.confirmed = False
+                await no_interaction.response.defer()
+            
+            confirm_view.add_item(yes_button)
+            confirm_view.add_item(no_button)
+            
             embed = discord.Embed(
                 title="⚠️ Confirm Cancellation",
                 description=f"Cancel **{d} {ts}**?",
                 color=discord.Color.orange()
             )
             
-            await interaction.response.send_message(embed=embed, view=confirm_view, ephemeral=True)
+            await select_interaction.response.send_message(embed=embed, view=confirm_view, ephemeral=True)
             await asyncio.sleep(60)
             
-            if confirm_view.result is True:
-                if cancel_slot_by_member(member_id, d, ts):
+            if confirm_view.confirmed is True:
+                if cancel_slot_by_member(mid, d, ts):
                     channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
                     if channel:
-                        embed = discord.Embed(
-                            title=f"⚠️ SLOT OPEN: {d} {ts}",
-                            description=f"{member.mention} just cancelled their {ts} slot.",
-                            color=discord.Color.orange()
-                        )
-                        embed.add_field(name="Slot Info", value=f"⏰ Slot: {d} {ts}", inline=False)
-                        embed.add_field(name="React ✅", value="to claim this slot!", inline=False)
-                        embed.set_footer(text=f"day={d}|slot={ts}")
-                        await channel.send(embed=embed)
+                        try:
+                            embed = discord.Embed(
+                                title=f"⚠️ SLOT OPEN: {d} {ts}",
+                                description=f"{member.mention} just cancelled their {ts} slot.",
+                                color=discord.Color.orange()
+                            )
+                            embed.add_field(name="Slot Info", value=f"⏰ Slot: {d} {ts}", inline=False)
+                            embed.add_field(name="React ✅", value="to claim this slot!", inline=False)
+                            embed.set_footer(text=f"day={d}|slot={ts}")
+                            await channel.send(embed=embed)
+                        except:
+                            pass
                     
-                    await interaction.followup.send(f"✅ **Cancelled!** {d} {ts} released.", ephemeral=True)
+                    await select_interaction.followup.send(f"✅ **Cancelled!** {d} {ts} released.", ephemeral=True)
                 else:
-                    await interaction.followup.send("❌ Error cancelling. Try again.", ephemeral=True)
-            elif confirm_view.result is False:
-                await interaction.followup.send("✅ Slot kept.", ephemeral=True)
+                    await select_interaction.followup.send("❌ Error cancelling. Try again.", ephemeral=True)
+            elif confirm_view.confirmed is False:
+                await select_interaction.followup.send("✅ Slot kept.", ephemeral=True)
             else:
-                await interaction.followup.send("❌ Confirmation timed out.", ephemeral=True)
+                await select_interaction.followup.send("❌ Confirmation timed out.", ephemeral=True)
         
         button = discord.ui.Button(label=label, style=discord.ButtonStyle.danger)
         button.callback = select_callback
