@@ -45,7 +45,7 @@ PENDING_CONFIRMATIONS = {}  # {f"{day}_{slot}": member_id}
 CACHE = {
     'bookings': None,
     'timestamp': None,
-    'ttl': 10  # 10 seconds
+    'ttl': 10  # seconds
 }
 
 # ============================================================================
@@ -61,10 +61,9 @@ def get_calendar_day():
 
 def get_current_calling_day():
     """
-    Returns the calling day for the current window.
-    7pm–11:59pm → same calendar day
-    12am–3:59am → previous calendar day (overnight shift)
-    Outside window → None
+    7pm-11:59pm -> same calendar day
+    12am-3:59am -> previous calendar day (overnight shift)
+    Outside window -> None
     """
     now = get_bd_time()
     hour = now.hour
@@ -102,10 +101,6 @@ def invalidate_cache():
     CACHE['timestamp'] = None
 
 def query_notion_database():
-    """
-    FIX: Use databases.query() instead of search().
-    search() is unreliable — it's a full-workspace search, not a DB query.
-    """
     if not notion:
         return []
     try:
@@ -270,16 +265,15 @@ def mark_slot_complete(member_id, day, time_slot):
     return False
 
 def get_member_slots(member_id):
-    """Get only future active slots for a member."""
+    """
+    FIX: Removed broken datetime math that was silently dropping valid bookings.
+    Status is the source of truth:
+      - 'booked'  = confirmed, not yet started
+      - 'called'  = currently in session
+    Completed/no-show/cancelled slots won't appear because their status has moved on.
+    """
     bookings = get_all_bookings()
     slots = []
-    now = get_bd_time()
-    days_list = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-
-    slot_hours = {
-        '7pm': 19, '8pm': 20, '9pm': 21, '10pm': 22, '11pm': 23,
-        '12am': 0, '1am': 1, '2am': 2, '3am': 3
-    }
 
     for booking in bookings:
         if booking['Member_ID'] != str(member_id):
@@ -288,24 +282,7 @@ def get_member_slots(member_id):
             continue
         if not booking['day'] or not booking['Time_Slot']:
             continue
-
-        try:
-            slot_hour = slot_hours[booking['Time_Slot']]
-            today_idx = now.weekday()
-            target_idx = days_list.index(booking['day'])
-            days_ahead = (target_idx - today_idx) % 7
-
-            slot_datetime = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
-            slot_datetime += timedelta(days=days_ahead)
-
-            # If the calculated time is in the past, push it one full week forward
-            if slot_datetime <= now:
-                slot_datetime += timedelta(weeks=1)
-
-            slots.append(booking)
-        except (ValueError, KeyError) as e:
-            print(f"Error calculating slot time for {booking}: {e}")
-            continue
+        slots.append(booking)
 
     return slots
 
@@ -317,7 +294,6 @@ def get_available_slots(day):
     return available
 
 def get_future_days():
-    """Return Mon–Fri only, starting from today."""
     today = get_bd_time()
     result = []
     days_list = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
@@ -336,7 +312,6 @@ def get_future_days():
     return result
 
 def build_dashboard_embed(day):
-    """Build the dashboard embed for a given day."""
     bookings = get_all_bookings()
 
     embed = discord.Embed(
@@ -393,9 +368,9 @@ def build_dashboard_embed(day):
                 break
 
         if booked_member:
-            queue_text += f"✅ {slot} → **{booked_member}**\n"
+            queue_text += f"✅ {slot} -> **{booked_member}**\n"
         else:
-            queue_text += f"⏳ {slot} → (Open)\n"
+            queue_text += f"⏳ {slot} -> (Open)\n"
 
     embed.add_field(
         name=f"👥 {day.upper()}'S QUEUE",
@@ -403,19 +378,17 @@ def build_dashboard_embed(day):
         inline=False
     )
 
-    embed.set_footer(text="📋 /book to book a slot  •  Last updated: " + get_bd_time().strftime("%I:%M %p BDT"))
+    embed.set_footer(text="📋 /book to book a slot  •  Updated: " + get_bd_time().strftime("%I:%M %p BDT"))
 
     return embed
 
 # ============================================================================
 # PERSISTENT DASHBOARD VIEW
-# FIX: Defined once at module level. custom_id ensures buttons survive restarts.
-# Clicking a button calls interaction.response.edit_message() directly — instant.
 # ============================================================================
 
 class DashboardView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # Never expires
+        super().__init__(timeout=None)
         self._build_buttons()
 
     def _build_buttons(self):
@@ -435,17 +408,21 @@ class DashboardView(discord.ui.View):
         async def callback(interaction: discord.Interaction):
             global CURRENT_DASHBOARD_DAY
             CURRENT_DASHBOARD_DAY = day_name
+
+            # FIX: Defer immediately to beat Discord's 3-second interaction timeout.
+            # Then build the embed (slow Notion call) and edit the message after.
+            await interaction.response.defer()
             embed = build_dashboard_embed(day_name)
-            # Responds directly to the interaction — no loop delay, ~200ms
-            await interaction.response.edit_message(embed=embed, view=self)
+            await interaction.message.edit(embed=embed, view=self)
+
         return callback
 
     def refresh_buttons(self):
-        """Call this daily to update which days appear (Mon–Fri rolling window)."""
+        """Call daily to keep the Mon-Fri rolling window current."""
         self._build_buttons()
 
 
-# Single persistent instance
+# Single persistent instance — registered with bot on startup
 DASHBOARD_VIEW = DashboardView()
 
 # ============================================================================
@@ -458,7 +435,7 @@ async def on_ready():
 
     print(f'{bot.user} has connected to Discord!')
 
-    # Register persistent view so buttons work after restarts
+    # Reconnects persistent view buttons after restarts
     bot.add_view(DASHBOARD_VIEW)
 
     for guild in bot.guilds:
@@ -498,7 +475,6 @@ async def on_ready():
 
 @bot.event
 async def on_reaction_add(reaction, user):
-    """Handle 👍 reactions for slot confirmation via DM."""
     if user == bot.user:
         return
 
@@ -515,7 +491,7 @@ async def on_reaction_add(reaction, user):
                 await user.send(f"✅ Confirmed! You're now live for **{day} {time_slot}**. You have 60 minutes — go!")
                 del PENDING_CONFIRMATIONS[key]
             else:
-                await user.send(f"⚠️ Could not confirm your slot. Please message an admin.")
+                await user.send("⚠️ Could not confirm your slot. Please message an admin.")
             return
 
 # ============================================================================
@@ -615,19 +591,19 @@ async def myslot_command(interaction: discord.Interaction):
     if not slots:
         embed = discord.Embed(
             title="📅 Your Slots",
-            description="You have no upcoming bookings.\nUse **/book** to grab a slot.",
+            description="You have no active bookings.\nUse **/book** to grab a slot.",
             color=discord.Color.greyple()
         )
     else:
         embed = discord.Embed(
-            title="📅 Your Upcoming Slots",
+            title="📅 Your Active Slots",
             color=discord.Color.blue()
         )
         for slot in slots:
-            emoji = "✅" if slot['Status'] == 'booked' else "🔴"
+            emoji = "🔴" if slot['Status'] == 'called' else "✅"
             embed.add_field(
-                name=f"{emoji} {slot['day']} {slot['Time_Slot']}",
-                value=f"Status: **{slot['Status']}**",
+                name=f"{emoji} {slot['day']} — {slot['Time_Slot']}",
+                value=f"Status: **{slot['Status'].capitalize()}**",
                 inline=False
             )
 
@@ -647,7 +623,7 @@ async def help_command(interaction: discord.Interaction):
     )
     embed.add_field(
         name="/myslot",
-        value="View your upcoming booked slots.",
+        value="View your active booked slots.",
         inline=False
     )
     embed.add_field(
@@ -670,11 +646,6 @@ async def help_command(interaction: discord.Interaction):
 
 @tasks.loop(seconds=30)
 async def update_dashboard():
-    """
-    FIX: Runs every 30s (was every 1s — caused Discord rate limits).
-    Day switching is now instant via DashboardView button callbacks,
-    so this loop only needs to handle periodic live status updates.
-    """
     global DASHBOARD_MESSAGE_ID, CURRENT_DASHBOARD_DAY
 
     if not DIALING_QUEUE_CHANNEL_ID:
@@ -702,7 +673,6 @@ async def update_dashboard():
                 print(f"Error editing dashboard message: {e}")
                 DASHBOARD_MESSAGE_ID = None
 
-        # Search for existing dashboard in recent history
         async for msg in channel.history(limit=20):
             if msg.author == bot.user and msg.embeds:
                 if "ZERO2HIRE CALLING SCHEDULER" in msg.embeds[0].title:
@@ -710,7 +680,6 @@ async def update_dashboard():
                     await msg.edit(embed=embed, view=DASHBOARD_VIEW)
                     return
 
-        # Create fresh dashboard
         msg = await channel.send(embed=embed, view=DASHBOARD_VIEW)
         await msg.pin()
         DASHBOARD_MESSAGE_ID = msg.id
@@ -722,7 +691,6 @@ async def update_dashboard():
 
 @tasks.loop(minutes=1)
 async def send_reminders():
-    """Send DM reminders: 30 min before slot and at slot start."""
     now = get_bd_time()
     hour = now.hour
     minute = now.minute
@@ -782,7 +750,6 @@ async def send_reminders():
 
 @tasks.loop(minutes=1)
 async def check_confirmations():
-    """At 10 minutes past slot start, mark unconfirmed slots as no-show."""
     now = get_bd_time()
     hour = now.hour
     minute = now.minute
@@ -830,7 +797,6 @@ async def check_confirmations():
 
 @tasks.loop(minutes=1)
 async def auto_complete_slots():
-    """Auto-complete a 'called' slot once the next hour begins (60 min session done)."""
     now = get_bd_time()
     hour = now.hour
     minute = now.minute
