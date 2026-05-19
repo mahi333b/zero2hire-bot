@@ -727,22 +727,18 @@ async def cancel_command(interaction: discord.Interaction):
                 )
                 return
             
-            # ✅ FIX: Proper parameter order
-            class ConfirmView(discord.ui.View):
-                result = None
-                
-                @discord.ui.button(label="CONFIRM CANCEL", style=discord.ButtonStyle.danger)
-                async def confirm(self, button: discord.ui.Button, confirm_interaction: discord.Interaction):
-                    self.result = True
-                    await confirm_interaction.response.defer()
-                
-                @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
-                async def keep(self, button: discord.ui.Button, keep_interaction: discord.Interaction):
-                    self.result = False
-                    await keep_interaction.response.defer()
-            
-            confirm_view = ConfirmView()
-            embed = discord.Embed(
+           class ConfirmView(discord.ui.View):
+    result = None
+    
+    @discord.ui.button(label="CONFIRM CANCEL", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction):
+        self.result = True
+        await interaction.response.defer()
+    
+    @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
+    async def keep(self, interaction: discord.Interaction):
+        self.result = False
+        await interaction.response.defer()
                 title="⚠️ Confirm Cancellation",
                 description=f"Cancel **{d} {ts}**?",
                 color=discord.Color.orange()
