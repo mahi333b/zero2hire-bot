@@ -567,14 +567,16 @@ async def book_command(interaction: discord.Interaction):
     # Filter only Mon-Fri
     valid_days = [d for d in future_days if d['name'] in DAYS]
     
-    # Create day selector view
+    # Create day selector view instance
     class DayView(discord.ui.View):
         selected_day = None
         
         async def on_timeout(self):
             await interaction.followup.send("❌ Booking timed out.", ephemeral=True)
     
-    # Add day buttons
+    day_view = DayView()
+    
+    # Add day buttons to the view instance
     for day_obj in valid_days:
         day_name = day_obj['name']
         label = f"{day_name}" + (" (Today)" if day_obj['is_today'] else "")
@@ -585,7 +587,7 @@ async def book_command(interaction: discord.Interaction):
         
         button = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
         button.callback = day_callback
-        DayView.add_item(button)
+        day_view.add_item(button)
     
     async def show_time_slots(interaction: discord.Interaction, day: str, mid: int):
         """Show available time slots for selected day"""
@@ -610,6 +612,8 @@ async def book_command(interaction: discord.Interaction):
         class TimeView(discord.ui.View):
             pass
         
+        time_view = TimeView()
+        
         for time_slot in available:
             async def time_btn_callback(interaction: discord.Interaction, ts=time_slot, d=day):
                 if book_slot(mid, str(member), d, ts):
@@ -629,21 +633,21 @@ async def book_command(interaction: discord.Interaction):
             
             button = discord.ui.Button(label=time_slot, style=discord.ButtonStyle.success)
             button.callback = time_btn_callback
-            TimeView.add_item(button)
+            time_view.add_item(button)
         
         embed = discord.Embed(
             title=f"📅 Available slots for {day}",
             description="Select a time to book:",
             color=discord.Color.blue()
         )
-        await interaction.followup.send(embed=embed, view=TimeView(), ephemeral=True)
+        await interaction.followup.send(embed=embed, view=time_view, ephemeral=True)
     
     embed = discord.Embed(
         title="📅 Select a day",
         description="Pick a day from the next 7 days (Mon–Fri only)",
         color=discord.Color.blue()
     )
-    await interaction.followup.send(embed=embed, view=DayView(), ephemeral=True)
+    await interaction.followup.send(embed=embed, view=day_view, ephemeral=True)
 
 @bot.tree.command(name="cancel", description="Cancel your booking")
 async def cancel_command(interaction: discord.Interaction, day: str, time: str):
