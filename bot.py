@@ -34,7 +34,7 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 
 # Global variables
 DIALING_QUEUE_CHANNEL_ID = None
-CURRENT_DASHBOARD_DAY = None
+DASHBOARD_MESSAGE_ID = None  # ✅ FIX: Track dashboard message ID to prevent duplicates
 
 TIME_SLOTS = ['7pm', '8pm', '9pm', '10pm', '11pm', '12am', '1am', '2am', '3am']
 DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
@@ -273,6 +273,7 @@ def mark_slot_complete(member_id, day, time_slot):
             return True
     return False
 
+# ✅ FIX: Rewritten to use day parameter properly
 def can_cancel_slot(day, time_slot):
     """Check if 3+ hours before slot"""
     now = get_bd_time()
@@ -286,10 +287,19 @@ def can_cancel_slot(day, time_slot):
     if slot_hour is None:
         return False
     
-    # Create datetime for slot
-    slot_datetime = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+    # Get day of week indices
+    days_list = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    today_idx = now.weekday()
+    target_idx = days_list.index(day)
     
-    # If slot is in the past, it's next occurrence
+    # Calculate days ahead to reach target day
+    days_ahead = (target_idx - today_idx) % 7
+    
+    # Create datetime for the slot on target day
+    slot_datetime = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+    slot_datetime += timedelta(days=days_ahead)
+    
+    # If calculated datetime is in the past, it's next week's occurrence
     if slot_datetime < now:
         slot_datetime += timedelta(days=7)
     
@@ -304,13 +314,49 @@ def get_available_slots(day):
             available.append(slot)
     return available
 
+# ✅ FIX: Show only future, active bookings
 def get_member_slots(member_id):
-    """Get all slots for a member"""
+    """Get only FUTURE active slots for a member (booked or called status)"""
     bookings = get_all_bookings()
     slots = []
+    now = get_bd_time()
+    days_list = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    
     for booking in bookings:
-        if booking['Member_ID'] == str(member_id):
-            slots.append(booking)
+        # Filter 1: Only this member
+        if booking['Member_ID'] != str(member_id):
+            continue
+        
+        # Filter 2: Only active statuses (no cancelled, no-show)
+        if booking['Status'] not in ['booked', 'called']:
+            continue
+        
+        # Filter 3: Only future slots
+        if not booking['day'] or not booking['Time_Slot']:
+            continue
+        
+        try:
+            slot_hours = {
+                '7pm': 19, '8pm': 20, '9pm': 21, '10pm': 22, '11pm': 23,
+                '12am': 0, '1am': 1, '2am': 2, '3am': 3
+            }
+            slot_hour = slot_hours[booking['Time_Slot']]
+            today_idx = now.weekday()
+            target_idx = days_list.index(booking['day'])
+            days_ahead = (target_idx - today_idx) % 7
+            
+            slot_datetime = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+            slot_datetime += timedelta(days=days_ahead)
+            
+            if slot_datetime < now:
+                slot_datetime += timedelta(days=7)
+            
+            # Only add if slot is in the future
+            if slot_datetime > now:
+                slots.append(booking)
+        except (ValueError, KeyError):
+            continue
+    
     return slots
 
 def get_future_days(days_ahead=7):
@@ -388,7 +434,7 @@ def build_dashboard_embed(day):
             inline=False
         )
     
-    # Show all slots for selected day
+    # Show all slots for selected day (TODAY ONLY NOW)
     queue_text = ""
     for slot in TIME_SLOTS:
         booked_member = None
@@ -421,7 +467,7 @@ def build_dashboard_embed(day):
 @bot.event
 async def on_ready():
     """Bot startup event"""
-    global DIALING_QUEUE_CHANNEL_ID, CURRENT_DASHBOARD_DAY
+    global DIALING_QUEUE_CHANNEL_ID
     try:
         print(f'{bot.user} has connected to Discord!')
         
@@ -437,8 +483,6 @@ async def on_ready():
         if not DIALING_QUEUE_CHANNEL_ID:
             print("❌ #dialing-queue channel not found!")
         
-        CURRENT_DASHBOARD_DAY = get_calendar_day()
-        
         try:
             synced = await bot.tree.sync()
             print(f'✅ Synced {len(synced)} command(s)')
@@ -449,7 +493,7 @@ async def on_ready():
         try:
             if not update_dashboard.is_running():
                 update_dashboard.start()
-                print("✅ Dashboard task started (5-sec refresh)")
+                print("✅ Dashboard task started (2-sec refresh)")
         except Exception as e:
             print(f"❌ Dashboard task error: {e}")
         
@@ -644,77 +688,108 @@ async def book_command(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=embed, view=day_view, ephemeral=True)
 
+# ✅ FIX: Completely rebuilt - interactive slot selection with proper button callbacks
 @bot.tree.command(name="cancel", description="Cancel your booking")
-async def cancel_command(interaction: discord.Interaction, day: str, time: str):
-    """Cancel a slot"""
+async def cancel_command(interaction: discord.Interaction):
+    """Cancel a slot - interactive version"""
     member = interaction.user
     member_id = member.id
     
-    if day not in DAYS or time not in TIME_SLOTS:
-        await interaction.response.send_message("❌ Invalid day or time.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    
+    # Get user's future active slots
+    slots = get_member_slots(member_id)
+    
+    if not slots:
+        await interaction.followup.send("❌ You have no upcoming bookings to cancel.", ephemeral=True)
         return
     
-    member_slots = get_member_slots(member_id)
-    if not any(s['day'] == day and s['Time_Slot'] == time for s in member_slots):
-        await interaction.response.send_message(f"❌ You don't have {day} {time} booked.", ephemeral=True)
-        return
-    
-    if not can_cancel_slot(day, time):
-        await interaction.response.send_message(
-            "❌ Too late to cancel. Must cancel 3+ hours before slot.",
-            ephemeral=True
-        )
-        return
-    
-    class ConfirmView(discord.ui.View):
-        result = None
+    # Build selection view
+    class SlotSelectView(discord.ui.View):
+        selected_slot = None
         
-        @discord.ui.button(label="CONFIRM CANCEL", style=discord.ButtonStyle.danger)
-        async def confirm(self, button: discord.ui.Button, i: discord.Interaction):
-            self.result = True
-            await i.response.defer()
+        async def on_timeout(self):
+            await interaction.followup.send("❌ Cancellation timed out.", ephemeral=True)
+    
+    view = SlotSelectView()
+    
+    for slot in slots:
+        day = slot['day']
+        time_slot = slot['Time_Slot']
+        label = f"{day} {time_slot}"
         
-        @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
-        async def keep(self, button: discord.ui.Button, i: discord.Interaction):
-            self.result = False
-            await i.response.defer()
-    
-    view = ConfirmView()
-    embed = discord.Embed(
-        title="⚠️ Cancel Booking?",
-        description=f"Cancel **{day} {time}**?",
-        color=discord.Color.orange()
-    )
-    
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-    await asyncio.sleep(60)
-    
-    if view.result:
-        if cancel_slot_by_member(member_id, day, time):
-            channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
-            if channel:
-                embed = discord.Embed(
-                    title=f"⚠️ SLOT OPEN: {day} {time}",
-                    description=f"{member.mention} just cancelled their {time} slot.",
-                    color=discord.Color.orange()
+        async def select_callback(interaction: discord.Interaction, d=day, ts=time_slot, slot_id=slot['id']):
+            # Check if can cancel
+            if not can_cancel_slot(d, ts):
+                await interaction.response.send_message(
+                    "❌ Too late to cancel. Must cancel 3+ hours before slot.",
+                    ephemeral=True
                 )
-                embed.add_field(name="Slot Info", value=f"⏰ Slot: {day} {time}", inline=False)
-                embed.add_field(name="React ✅", value="to claim this slot!", inline=False)
-                embed.set_footer(text=f"day={day}|slot={time}")
-                await channel.send(embed=embed)
+                return
             
-            await interaction.followup.send(f"✅ **Cancelled!** {day} {time} released.", ephemeral=True)
-        else:
-            await interaction.followup.send("❌ Error cancelling. Try again.", ephemeral=True)
-    else:
-        await interaction.followup.send("✅ Slot kept.", ephemeral=True)
+            # ✅ FIX: Proper parameter order
+            class ConfirmView(discord.ui.View):
+                result = None
+                
+                @discord.ui.button(label="CONFIRM CANCEL", style=discord.ButtonStyle.danger)
+                async def confirm(self, button: discord.ui.Button, confirm_interaction: discord.Interaction):
+                    self.result = True
+                    await confirm_interaction.response.defer()
+                
+                @discord.ui.button(label="KEEP MY SLOT", style=discord.ButtonStyle.primary)
+                async def keep(self, button: discord.ui.Button, keep_interaction: discord.Interaction):
+                    self.result = False
+                    await keep_interaction.response.defer()
+            
+            confirm_view = ConfirmView()
+            embed = discord.Embed(
+                title="⚠️ Confirm Cancellation",
+                description=f"Cancel **{d} {ts}**?",
+                color=discord.Color.orange()
+            )
+            
+            await interaction.response.send_message(embed=embed, view=confirm_view, ephemeral=True)
+            await asyncio.sleep(60)
+            
+            if confirm_view.result is True:
+                if cancel_slot_by_member(member_id, d, ts):
+                    channel = bot.get_channel(DIALING_QUEUE_CHANNEL_ID)
+                    if channel:
+                        embed = discord.Embed(
+                            title=f"⚠️ SLOT OPEN: {d} {ts}",
+                            description=f"{member.mention} just cancelled their {ts} slot.",
+                            color=discord.Color.orange()
+                        )
+                        embed.add_field(name="Slot Info", value=f"⏰ Slot: {d} {ts}", inline=False)
+                        embed.add_field(name="React ✅", value="to claim this slot!", inline=False)
+                        embed.set_footer(text=f"day={d}|slot={ts}")
+                        await channel.send(embed=embed)
+                    
+                    await interaction.followup.send(f"✅ **Cancelled!** {d} {ts} released.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Error cancelling. Try again.", ephemeral=True)
+            elif confirm_view.result is False:
+                await interaction.followup.send("✅ Slot kept.", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Confirmation timed out.", ephemeral=True)
+        
+        button = discord.ui.Button(label=label, style=discord.ButtonStyle.danger)
+        button.callback = select_callback
+        view.add_item(button)
+    
+    embed = discord.Embed(
+        title="📅 Select slot to cancel",
+        description="Pick a booking to cancel:",
+        color=discord.Color.blue()
+    )
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 @bot.tree.command(name="myslot", description="See your booked slots")
 async def myslot_command(interaction: discord.Interaction):
-    """Show member's slots"""
+    """Show member's FUTURE slots only"""
     member = interaction.user
     member_id = member.id
-    slots = get_member_slots(member_id)
+    slots = get_member_slots(member_id)  # ✅ FIX: Now returns only future active slots
     
     if not slots:
         embed = discord.Embed(
@@ -724,12 +799,12 @@ async def myslot_command(interaction: discord.Interaction):
         )
     else:
         embed = discord.Embed(
-            title="📅 Your Booked Slots",
-            description="Your calling slots:",
+            title="📅 Your Upcoming Slots",
+            description="Your future calling slots:",
             color=discord.Color.blue()
         )
         for slot in slots:
-            emoji = "✅" if slot['Status'] == 'booked' else "🔴" if slot['Status'] == 'called' else "⚠️"
+            emoji = "✅" if slot['Status'] == 'booked' else "🔴"
             embed.add_field(
                 name=f"{emoji} {slot['day']} {slot['Time_Slot']}",
                 value=f"Status: {slot['Status']}",
@@ -752,13 +827,13 @@ async def help_command(interaction: discord.Interaction):
         inline=False
     )
     embed.add_field(
-        name="/cancel [day] [time]",
-        value="Cancel a slot (3+ hours before)",
+        name="/cancel",
+        value="Cancel a slot (select from your bookings, 3+ hours before)",
         inline=False
     )
     embed.add_field(
         name="/myslot",
-        value="See your booked slots",
+        value="See your upcoming booked slots",
         inline=False
     )
     embed.add_field(
@@ -953,10 +1028,11 @@ async def check_slot_completion():
         except Exception as e:
             print(f"Error announcing completion: {e}")
 
-@tasks.loop(seconds=5)
+# ✅ FIX: Faster refresh (2 seconds) + message ID tracking to prevent duplicates
+@tasks.loop(seconds=2)
 async def update_dashboard():
-    """Update dashboard every 5 seconds"""
-    global CURRENT_DASHBOARD_DAY
+    """Update dashboard every 2 seconds"""
+    global DASHBOARD_MESSAGE_ID
     
     if not DIALING_QUEUE_CHANNEL_ID:
         return
@@ -966,45 +1042,31 @@ async def update_dashboard():
         return
     
     try:
-        if not CURRENT_DASHBOARD_DAY:
-            CURRENT_DASHBOARD_DAY = get_calendar_day()
+        # Always show TODAY'S queue (removed day navigation)
+        today = get_calendar_day()
+        embed = build_dashboard_embed(today)
         
-        embed = build_dashboard_embed(CURRENT_DASHBOARD_DAY)
+        # Try to edit existing dashboard message
+        if DASHBOARD_MESSAGE_ID:
+            try:
+                msg = await channel.fetch_message(DASHBOARD_MESSAGE_ID)
+                await msg.edit(embed=embed)
+                return
+            except:
+                DASHBOARD_MESSAGE_ID = None
         
-        class DayNav(discord.ui.View):
-            pass
-        
-        view = DayNav()
-        
-        future_days = get_future_days(7)
-        valid_days = [d for d in future_days if d['name'] in DAYS]
-        
-        for day_obj in valid_days:
-            day_name = day_obj['name']
-            label = f"{day_name}" + (" (Today)" if day_obj['is_today'] else "")
-            
-            async def day_btn(interaction: discord.Interaction, d=day_name):
-                global CURRENT_DASHBOARD_DAY
-                CURRENT_DASHBOARD_DAY = d
-                await interaction.response.defer()
-            
-            button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
-            button.callback = day_btn
-            view.add_item(button)
-        
-        # Find and edit existing message
-        found = False
-        async for msg in channel.history(limit=10):
+        # If no tracked message, find it in channel
+        async for msg in channel.history(limit=20):
             if msg.author == bot.user and msg.embeds:
                 if "ZERO2HIRE CALLING SCHEDULER" in msg.embeds[0].title:
-                    await msg.edit(embed=embed, view=view)
-                    found = True
-                    break
+                    DASHBOARD_MESSAGE_ID = msg.id
+                    await msg.edit(embed=embed)
+                    return
         
-        # If not found, create new pinned message
-        if not found:
-            msg = await channel.send(embed=embed, view=view)
-            await msg.pin()
+        # Create new dashboard if not found
+        msg = await channel.send(embed=embed)
+        await msg.pin()
+        DASHBOARD_MESSAGE_ID = msg.id
     
     except Exception as e:
         print(f"Error updating dashboard: {e}")
