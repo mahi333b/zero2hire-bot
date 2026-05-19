@@ -134,7 +134,7 @@ def get_all_bookings():
             'day': props['day']['select']['name'] if props['day']['select'] else None,
             'Time_Slot': props['Time_Slot']['select']['name'] if props['Time_Slot']['select'] else None,
             'Member_ID': props['Member_ID']['rich_text'][0]['text']['content'] if props['Member_ID']['rich_text'] else None,
-            'Member_Name': props['Member_Name']['rich_text'][0]['text']['content'] if props['Member_Name']['rich_text'] else None,
+            'Member_Name': props['Member_Name']['title'][0]['text']['content'] if props['Member_Name']['title'] else None,
             'Status': props['Status']['select']['name'] if props['Status']['select'] else None,
             'Booked_At': props['Booked_At']['date']['start'] if props['Booked_At']['date'] else None,
             'Called_At': props['Called_At']['date']['start'] if props['Called_At']['date'] else None,
@@ -181,7 +181,7 @@ def create_booking(member_id, member_name, day, time_slot):
                 "day": {"select": {"name": day}},
                 "Time_Slot": {"select": {"name": time_slot}},
                 "Member_ID": {"rich_text": [{"text": {"content": str(member_id)}}]},
-                "Member_Name": {"rich_text": [{"text": {"content": str(member_name)}}]},
+                "Member_Name": {"title": [{"text": {"content": str(member_name)}}]},
                 "Status": {"select": {"name": "booked"}},
                 "Booked_At": {"date": {"start": get_bd_time().isoformat()}},
             }
