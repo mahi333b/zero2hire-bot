@@ -79,7 +79,6 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 
 DIALING_QUEUE_CHANNEL_ID = None
 DASHBOARD_MESSAGE_ID = None
-CURRENT_DASHBOARD_DAY = None
 DASHBOARD_VIEW = None  # Initialized inside on_ready() after event loop starts
 
 # Async locks for thread-safe state management
@@ -106,9 +105,12 @@ def get_bd_time():
     return datetime.now(BD_TZ)
 
 def get_calendar_day():
-    """Get current calendar day name."""
+    """Get current calendar day, rolling over at 4am."""
+    now = get_bd_time()
+    if now.hour < 4:
+        now = now - timedelta(days=1)
     days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-    return days[get_bd_time().weekday()]
+    return days[now.weekday()]
 
 def get_current_calling_day():
     """
@@ -466,53 +468,12 @@ def build_dashboard_embed(day):
     return embed
 
 # ============================================================================
-# PERSISTENT DASHBOARD VIEW (Improved - Private View)
+# PERSISTENT DASHBOARD VIEW
 # ============================================================================
 
 class DashboardView(discord.ui.View):
-    def __init__(self, is_persistent=False):
-        super().__init__(timeout=None if is_persistent else 300)  # 5 min timeout for private views
-        self._build_buttons(is_persistent)
-
-    def _build_buttons(self, is_persistent=False):
-        self.clear_items()
-        for day_obj in get_future_days():
-            day_name = day_obj['name']
-            label = day_name + (" (Today)" if day_obj['is_today'] else "")
-            
-            btn = discord.ui.Button(
-                label=label,
-                style=discord.ButtonStyle.secondary,
-            )
-            if is_persistent:
-                btn.custom_id = f"dash_day_{day_name}"
-            
-            btn.callback = self._make_day_callback(day_name)
-            self.add_item(btn)
-
-    def _make_day_callback(self, day_name: str):
-        async def callback(interaction: discord.Interaction):
-            try:
-                await interaction.response.defer(ephemeral=True)
-                embed = build_dashboard_embed(day_name)
-                
-                # Send private response
-                await interaction.followup.send(
-                    embed=embed, 
-                    view=DashboardView(is_persistent=False),  
-                    ephemeral=True
-                )
-                
-                logger.info(f"{interaction.user} viewed {day_name} queue privately")
-                
-            except Exception as e:
-                logger.error(f"Error in dashboard button: {e}")
-                try:
-                    await interaction.followup.send("❌ Something went wrong. Please try again.", ephemeral=True)
-                except:
-                    pass
-
-        return callback
+    def __init__(self):
+        super().__init__(timeout=None)
 
 # ============================================================================
 # DISCORD BOT EVENTS
@@ -520,13 +481,13 @@ class DashboardView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    global DIALING_QUEUE_CHANNEL_ID, CURRENT_DASHBOARD_DAY, DASHBOARD_VIEW
+    global DIALING_QUEUE_CHANNEL_ID, DASHBOARD_VIEW
 
     logger.info(f'{bot.user} has connected to Discord!')
 
     # Initialize DASHBOARD_VIEW here so it runs inside the event loop
     DASHBOARD_VIEW = DashboardView()
-    bot.add_view(DASHBOARD_VIEW)   # This is for the main public dashboard
+    bot.add_view(DASHBOARD_VIEW)
 
     for guild in bot.guilds:
         for channel in guild.channels:
@@ -534,9 +495,6 @@ async def on_ready():
                 DIALING_QUEUE_CHANNEL_ID = channel.id
                 logger.info(f"✅ Found dialing-queue channel: {DIALING_QUEUE_CHANNEL_ID}")
                 break
-
-    async with STATE_LOCK:
-        CURRENT_DASHBOARD_DAY = get_calendar_day()
 
     try:
         synced = await bot.tree.sync()
@@ -755,7 +713,7 @@ async def help_command(interaction: discord.Interaction):
 @tasks.loop(seconds=30)
 async def update_dashboard():
     """Update the dashboard message every 30 seconds."""
-    global DASHBOARD_MESSAGE_ID, CURRENT_DASHBOARD_DAY
+    global DASHBOARD_MESSAGE_ID
 
     if not DIALING_QUEUE_CHANNEL_ID:
         return
@@ -765,12 +723,7 @@ async def update_dashboard():
         return
 
     try:
-        async with STATE_LOCK:
-            if not CURRENT_DASHBOARD_DAY:
-                CURRENT_DASHBOARD_DAY = get_calendar_day()
-            day_to_display = CURRENT_DASHBOARD_DAY
-
-        embed = build_dashboard_embed(day_to_display)
+        embed = build_dashboard_embed(get_calendar_day())
 
         if DASHBOARD_MESSAGE_ID:
             try:
@@ -796,7 +749,7 @@ async def update_dashboard():
                     return
 
         # Create new dashboard if not found
-        msg = await channel.send(embed=embed, view=DashboardView(is_persistent=True))
+        msg = await channel.send(embed=embed, view=DASHBOARD_VIEW)
         await msg.pin()
         async with STATE_LOCK:
             DASHBOARD_MESSAGE_ID = msg.id
