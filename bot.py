@@ -349,14 +349,14 @@ def mark_slot_complete(member_id, day, time_slot):
     return False
 
 def get_member_slots(member_id):
-    """Get all active slots for a member (booked or called)."""
+    """Get all upcoming slots for a member (booked only)."""
     bookings = get_all_bookings()
     slots = []
 
     for booking in bookings:
         if booking['Member_ID'] != str(member_id):
             continue
-        if booking['Status'] not in ['booked', 'called']:
+        if booking['Status'] != 'booked':  # ← ONLY SHOW BOOKED
             continue
         if not booking['day'] or not booking['Time_Slot']:
             continue
